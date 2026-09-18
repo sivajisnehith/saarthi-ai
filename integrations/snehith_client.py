@@ -277,3 +277,11 @@ class SnehithClient:
         return await self.get(
             f"/api/payments/{payment_id}",
         )
+
+    async def get_ticket(
+        self,
+        booking_id: int,
+    ):
+        return await self.get(
+            f"/api/tickets/{booking_id}",
+        )

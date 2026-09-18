@@ -3,6 +3,7 @@ from strands import tool
 from integrations.snehith_client import SnehithClient
 from tools.seat_optimizer import find_best_group
 from tools.seat_optimizer import find_best_group
+from utils.ticket_pdf import generate_ticket_pdf
 
 client = SnehithClient()
 
@@ -266,3 +267,112 @@ async def hold_seats(
     )
 
     return result
+@tool
+async def create_booking(
+    bus_id: int,
+    journey_date: str,
+    boarding_point: str,
+    dropping_point: str,
+    passengers: list[dict],
+    hold_token: str,
+) -> dict:
+    """
+    Create a booking using seats that have already been held.
+
+    The customer must explicitly confirm the booking before this
+    tool is called.
+    """
+
+    result = await client.create_booking(
+        bus_id=bus_id,
+        journey_date=journey_date,
+        boarding_point=boarding_point,
+        dropping_point=dropping_point,
+        passengers=passengers,
+        hold_token=hold_token,
+    )
+
+    return result
+
+
+@tool
+async def create_payment(
+    booking_id: int,
+) -> dict:
+    """
+    Create a Razorpay payment link for a confirmed booking.
+
+    Only call this after the customer explicitly confirms that
+    they want to proceed with payment.
+    """
+
+    result = await client.create_payment(
+        booking_id=booking_id,
+    )
+
+    return result
+
+
+@tool
+async def get_payment_status(
+    payment_id: int,
+) -> dict:
+    """
+    Check the authoritative payment status of a payment.
+    """
+
+    result = await client.get_payment(
+        payment_id=payment_id,
+    )
+
+    return result
+
+
+@tool
+async def get_ticket(
+    booking_id: int,
+) -> dict:
+    """
+    Retrieve the confirmed digital ticket for a booking.
+    """
+
+    result = await client.get_ticket(
+        booking_id=booking_id,
+    )
+
+    return result
+
+@tool
+async def generate_ticket(
+    booking_id: int,
+) -> dict:
+    """
+    Retrieve a confirmed ticket and generate its PDF.
+
+    The booking must already be confirmed.
+    """
+
+    ticket = await client.get_ticket(
+        booking_id=booking_id,
+    )
+
+    if ticket.get("status") != "CONFIRMED":
+        return {
+            "success": False,
+            "reason": (
+                "The ticket cannot be generated because "
+                f"the booking status is {ticket.get('status')}."
+            ),
+        }
+
+    pdf_path = generate_ticket_pdf(
+        ticket
+    )
+
+    return {
+        "success": True,
+        "booking_id": booking_id,
+        "booking_reference": ticket["booking_reference"],
+        "pdf_path": pdf_path,
+        "ticket": ticket,
+    }
