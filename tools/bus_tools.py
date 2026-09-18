@@ -1,11 +1,15 @@
 from strands import tool
 
 from integrations.snehith_client import SnehithClient
+from integrations.email_client import EmailClient
+from integrations.whatsapp_client import WhatsAppClient
 from tools.seat_optimizer import find_best_group
 from tools.seat_optimizer import find_best_group
 from utils.ticket_pdf import generate_ticket_pdf
 
 client = SnehithClient()
+email_client = EmailClient()
+whatsapp_client = WhatsAppClient()
 
 
 @tool
@@ -376,6 +380,44 @@ async def generate_ticket(
         "pdf_path": pdf_path,
         "ticket": ticket,
     }
+
+
+@tool
+async def deliver_ticket_to_whatsapp(
+    booking_id: int,
+    destination: str,
+    ticket_path: str,
+) -> dict:
+    """Send a generated ticket PDF to the customer's WhatsApp number.
+
+    Use only after the customer explicitly confirms they want the ticket sent
+    to the WhatsApp number previously provided for this booking.
+    """
+    result = await whatsapp_client.send_ticket(
+        destination=destination,
+        ticket_path=ticket_path,
+    )
+    return {**result, "booking_id": booking_id}
+
+
+@tool
+async def deliver_ticket_to_email(
+    booking_id: int,
+    destination: str,
+    ticket_path: str,
+) -> dict:
+    """Email a generated ticket PDF to the customer.
+
+    Use only after the customer provides and explicitly confirms the email
+    address to use for this booking.
+    """
+    result = await email_client.send_ticket(
+        destination=destination,
+        ticket_path=ticket_path,
+    )
+    return {**result, "booking_id": booking_id}
+
+
 @tool
 async def deliver_payment_link(
     booking_id: int,
