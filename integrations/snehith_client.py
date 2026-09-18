@@ -255,3 +255,25 @@ class SnehithClient:
             "/api/bookings",
             json=payload,
         )
+    async def create_payment(
+        self,
+        booking_id: int,
+        payment_method: str = "RAZORPAY_PAYMENT_LINK",
+    ):
+        payload = {
+            "booking_id": booking_id,
+            "payment_method": payment_method,
+        }
+
+        return await self.post(
+            "/api/payments",
+            json=payload,
+        )
+    
+    async def get_payment(
+        self,
+        payment_id: int,
+    ):
+        return await self.get(
+            f"/api/payments/{payment_id}",
+        )
