@@ -376,3 +376,19 @@ async def generate_ticket(
         "pdf_path": pdf_path,
         "ticket": ticket,
     }
+@tool
+async def deliver_payment_link(
+    booking_id: int,
+    destination: str,
+) -> dict:
+    """
+    Send the customer's Razorpay payment link to their WhatsApp number.
+    The customer must provide and confirm the WhatsApp number before this tool is used.
+    """
+    result = await client.deliver_payment_link(
+        booking_id=booking_id,
+        channel="WHATSAPP",
+        destination=destination,
+    )
+
+    return result

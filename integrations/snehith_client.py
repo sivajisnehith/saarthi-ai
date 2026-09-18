@@ -21,7 +21,7 @@ class SnehithClient:
             "password": SNEHITH_ADMIN_PASSWORD,
         }
 
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 url,
                 json=payload,
@@ -56,7 +56,7 @@ class SnehithClient:
 
         url = f"{self.base_url}{path}"
 
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(
                 url,
                 params=params,
@@ -87,7 +87,7 @@ class SnehithClient:
 
         url = f"{self.base_url}{path}"
 
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 url,
                 json=json,
@@ -269,6 +269,17 @@ class SnehithClient:
             "/api/payments",
             json=payload,
         )
+
+    async def get_bookings(self):
+        return await self.get("/api/bookings")
+
+    async def get_booking(
+        self,
+        booking_id: int,
+    ):
+        return await self.get(
+            f"/api/bookings/{booking_id}",
+        )
     
     async def get_payment(
         self,
@@ -284,4 +295,20 @@ class SnehithClient:
     ):
         return await self.get(
             f"/api/tickets/{booking_id}",
+        )
+    async def deliver_payment_link(
+        self,
+        booking_id: int,
+        channel: str,
+        destination: str,
+    ):
+        payload = {
+            "booking_id": booking_id,
+            "channel": channel,
+            "destination": destination,
+        }
+
+        return await self.post(
+            "/api/payments/deliver-link",
+            json=payload,
         )

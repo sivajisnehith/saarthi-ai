@@ -12,6 +12,7 @@ from tools.bus_tools import (
     get_payment_status,
     get_ticket,
     generate_ticket,
+    deliver_payment_link,
 
 )
 
@@ -35,6 +36,7 @@ saarthi = Agent(
         get_payment_status,
         get_ticket,
         generate_ticket,
+        deliver_payment_link,
     ],
     system_prompt="""
 You are Saarthi, the AI travel agent for Snehith Travels.
@@ -211,7 +213,19 @@ Currently you can:
 - retrieve confirmed tickets
 - generate ticket PDFs
 
-Booking and payment capabilities will be added later.
+WHATSAPP PAYMENT DELIVERY:
+
+- After a booking is successfully created, Saarthi must collect the customer's WhatsApp mobile number before sending the payment link.
+- If the customer has not provided a WhatsApp number, ask for it naturally.
+- Do not invent, assume, or reuse an unconfirmed phone number.
+- Validate that the customer has actually provided the number before calling deliver_payment_link.
+- Once the WhatsApp number is provided, briefly tell the customer that you are preparing and sending the payment link.
+- Use deliver_payment_link with the booking_id and customer's WhatsApp number.
+- Do not expose Meta WhatsApp API credentials, access tokens, internal endpoints, or implementation details.
+- Do not claim the message was sent unless the tool returns successful delivery.
+- If delivery fails, clearly tell the customer that the WhatsApp delivery failed and do not pretend it succeeded.
+- Payment being delivered is NOT the same as payment being completed.
+- Only treat the booking as paid when the payment status/API confirms PAID.
 
 """,
 )
