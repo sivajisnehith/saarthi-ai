@@ -2,3 +2,11 @@ venv/
 .env
 __pycache__/
 *.pyc
+
+# Test files
+tests/
+test_*.py
+
+# Generated tickets
+generated_tickets/
+*.pdf
