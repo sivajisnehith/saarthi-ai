@@ -1,7 +1,8 @@
 from strands import tool
 
 from integrations.snehith_client import SnehithClient
-
+from tools.seat_optimizer import find_best_group
+from tools.seat_optimizer import find_best_group
 
 client = SnehithClient()
 
@@ -133,6 +134,115 @@ async def recommend_seats(
         seater=seater,
         maximum_budget=maximum_budget,
         limit=max(passengers, 5),
+    )
+
+    return result
+@tool
+async def find_group_seats(
+    bus_id: int,
+    journey_date: str,
+    passengers: int,
+    window: bool = False,
+    aisle: bool = False,
+    lower: bool = False,
+    upper: bool = False,
+    front: bool = False,
+    rear: bool = False,
+    sleeper: bool = False,
+    seater: bool = False,
+) -> dict:
+    """
+    Find the most compact group of available seats for multiple passengers.
+
+    Prioritizes keeping passengers together while respecting
+    requested seat preferences.
+
+    Args:
+        bus_id: Snehith Travels bus ID.
+        journey_date: Journey date in YYYY-MM-DD format.
+        passengers: Number of passengers.
+        window: Prefer window seats.
+        aisle: Prefer aisle seats.
+        lower: Prefer lower-deck seats.
+        upper: Prefer upper-deck seats.
+        front: Prefer front seats.
+        rear: Prefer rear seats.
+        sleeper: Prefer sleeper seats.
+        seater: Prefer seater seats.
+
+    Returns:
+        Best available group of seats.
+    """
+
+    seat_data = await client.get_seats(
+        bus_id=bus_id,
+        journey_date=journey_date,
+    )
+
+    seats = seat_data.get("seats", [])
+
+    result = find_best_group(
+        seats=seats,
+        passengers=passengers,
+        window=window,
+        aisle=aisle,
+        lower=lower,
+        upper=upper,
+        front=front,
+        rear=rear,
+        sleeper=sleeper,
+        seater=seater,
+    )
+
+    return result
+
+@tool
+async def find_group_seats(
+    bus_id: int,
+    journey_date: str,
+    passengers: int,
+    window: bool = False,
+    aisle: bool = False,
+    lower: bool = False,
+    upper: bool = False,
+    front: bool = False,
+    rear: bool = False,
+    sleeper: bool = False,
+    seater: bool = False,
+) -> dict:
+    """
+    Find the best available group of seats for multiple passengers.
+
+    Prioritizes keeping passengers together while respecting
+    requested seat preferences.
+    """
+
+    if passengers < 1 or passengers > 10:
+        return {
+            "success": False,
+            "reason": "The supported group size is between 1 and 10 passengers.",
+        }
+
+    # Get the actual current seat availability from Snehith.
+    seat_data = await client.get_seats(
+        bus_id=bus_id,
+        journey_date=journey_date,
+    )
+
+    seats = seat_data.get("seats", [])
+
+    # Run deterministic seat optimization.
+    result = find_best_group(
+        seats=seats,
+        passengers=passengers,
+        window=window,
+        aisle=aisle,
+        lower=lower,
+        upper=upper,
+        front=front,
+        rear=rear,
+        sleeper=sleeper,
+        seater=seater,
     )
 
     return result

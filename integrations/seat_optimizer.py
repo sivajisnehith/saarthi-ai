@@ -57,7 +57,9 @@ def preference_score(
     return score
 
 
-def build_adjacency_graph(seats: list[dict]) -> dict[int, set[int]]:
+def build_adjacency_graph(
+    seats: list[dict],
+) -> dict[int, set[int]]:
     """
     Build a graph where each seat is connected to physically
     nearby seats.
@@ -75,7 +77,7 @@ def build_adjacency_graph(seats: list[dict]) -> dict[int, set[int]]:
             if i == j:
                 continue
 
-            # Different decks should not be considered directly adjacent.
+            # Different decks are not directly adjacent.
             if seat_a["upper_lower"] != seat_b["upper_lower"]:
                 continue
 
@@ -93,14 +95,16 @@ def build_adjacency_graph(seats: list[dict]) -> dict[int, set[int]]:
                 and column_difference <= 3
             )
 
-            # Seats immediately behind/in front of each other.
+            # Same column in immediately adjacent rows.
             nearby_row = (
                 row_difference == 1
                 and column_difference <= 1
             )
 
             if same_row or nearby_row:
-                graph[seat_a["id"]].add(seat_b["id"])
+                graph[seat_a["id"]].add(
+                    seat_b["id"]
+                )
 
     return graph
 
@@ -108,9 +112,16 @@ def build_adjacency_graph(seats: list[dict]) -> dict[int, set[int]]:
 def group_togetherness_score(
     seats: list[dict],
 ) -> float:
+    """
+    Calculate how physically compact a group of seats is.
+
+    Higher score = better grouping.
+    """
 
     if not seats:
         return float("-inf")
+
+    score = 0
 
     # -------------------------------------------------
     # Same deck
@@ -120,8 +131,6 @@ def group_togetherness_score(
         seat["upper_lower"]
         for seat in seats
     }
-
-    score = 0
 
     if len(decks) == 1:
         score += 100
@@ -149,7 +158,7 @@ def group_togetherness_score(
     else:
         score -= (row_count - 3) * 50
 
-       # -------------------------------------------------
+    # -------------------------------------------------
     # Same-row grouping
     # -------------------------------------------------
 
@@ -166,7 +175,6 @@ def group_togetherness_score(
 
         row_sizes.append(count)
 
-        # Strong bonus for seats sharing the same row.
         if count == 2:
             score += 180
 
@@ -174,7 +182,9 @@ def group_togetherness_score(
             score += 400
 
         elif count > 3:
-            score += 400 + (count - 3) * 100
+            score += 400 + (
+                (count - 3) * 100
+            )
 
     # -------------------------------------------------
     # Reward larger groups over fragmented groups
@@ -225,13 +235,26 @@ def calculate_group_score(
     sleeper: bool = False,
     seater: bool = False,
 ) -> float:
+    """
+    Calculate the overall score of a seat group.
+
+    Togetherness is the primary objective.
+    Customer preferences are secondary.
+    Price has a small influence.
+    """
 
     score = 0
 
-    # Togetherness is the primary objective.
+    # -------------------------------------------------
+    # Togetherness
+    # -------------------------------------------------
+
     score += group_togetherness_score(seats)
 
-    # Customer preferences.
+    # -------------------------------------------------
+    # Customer preferences
+    # -------------------------------------------------
+
     for seat in seats:
 
         score += preference_score(
@@ -246,15 +269,90 @@ def calculate_group_score(
             seater=seater,
         )
 
-    # Slight price preference.
+    # -------------------------------------------------
+    # Price
+    # -------------------------------------------------
+
     total_price = sum(
         seat["price"]
         for seat in seats
     )
 
+    # Price is intentionally a small factor.
     score -= total_price * 0.02
 
     return score
+
+
+def analyze_group(
+    seats: list[dict],
+) -> dict:
+    """
+    Produce human-readable information about
+    how well the selected seats are grouped.
+    """
+
+    if not seats:
+        return {
+            "rows_used": 0,
+            "row_distribution": [],
+            "same_deck": False,
+            "consecutive_rows": False,
+            "rows": [],
+        }
+
+    # -------------------------------------------------
+    # Rows
+    # -------------------------------------------------
+
+    rows = sorted(
+        {
+            seat["row"]
+            for seat in seats
+        }
+    )
+
+    # -------------------------------------------------
+    # Number of seats per row
+    # -------------------------------------------------
+
+    row_counts = defaultdict(int)
+
+    for seat in seats:
+        row_counts[seat["row"]] += 1
+
+    row_distribution = sorted(
+        row_counts.values(),
+        reverse=True,
+    )
+
+    # -------------------------------------------------
+    # Deck
+    # -------------------------------------------------
+
+    decks = {
+        seat["upper_lower"]
+        for seat in seats
+    }
+
+    same_deck = len(decks) == 1
+
+    # -------------------------------------------------
+    # Consecutive rows
+    # -------------------------------------------------
+
+    consecutive_rows = all(
+        rows[i + 1] - rows[i] == 1
+        for i in range(len(rows) - 1)
+    )
+
+    return {
+        "rows_used": len(rows),
+        "row_distribution": row_distribution,
+        "same_deck": same_deck,
+        "consecutive_rows": consecutive_rows,
+        "rows": rows,
+    }
 
 
 def find_best_group(
@@ -270,6 +368,36 @@ def find_best_group(
     sleeper: bool = False,
     seater: bool = False,
 ) -> dict:
+    """
+    Find the best available group of seats.
+
+    Primary goal:
+        Keep passengers together.
+
+    Secondary goals:
+        Respect customer preferences.
+
+    Tertiary goal:
+        Prefer cheaper seats.
+    """
+
+    # -------------------------------------------------
+    # Validate passenger count
+    # -------------------------------------------------
+
+    if passengers < 1 or passengers > 10:
+
+        return {
+            "success": False,
+            "reason": (
+                "The supported group size is "
+                "between 1 and 10 passengers."
+            ),
+        }
+
+    # -------------------------------------------------
+    # Available seats
+    # -------------------------------------------------
 
     available = [
         seat
@@ -287,18 +415,8 @@ def find_best_group(
             ),
         }
 
-    if passengers < 1 or passengers > 10:
-
-        return {
-            "success": False,
-            "reason": (
-                "The supported group size is "
-                "between 1 and 10 passengers."
-            ),
-        }
-
     # -------------------------------------------------
-    # Build lookup and graph
+    # Build lookup
     # -------------------------------------------------
 
     seat_by_id = {
@@ -306,18 +424,25 @@ def find_best_group(
         for seat in available
     }
 
-    graph = build_adjacency_graph(available)
+    # -------------------------------------------------
+    # Build adjacency graph
+    # -------------------------------------------------
+
+    graph = build_adjacency_graph(
+        available
+    )
 
     # -------------------------------------------------
-    # Candidate groups
+    # Generate candidate groups
     # -------------------------------------------------
 
     candidates = []
 
-    # Start a candidate group from every seat.
     for start_seat in available:
 
-        group = [start_seat]
+        group = [
+            start_seat
+        ]
 
         visited = {
             start_seat["id"]
@@ -327,7 +452,10 @@ def find_best_group(
             start_seat["id"]
         ]
 
-        while frontier and len(group) < passengers:
+        while (
+            frontier
+            and len(group) < passengers
+        ):
 
             current_id = frontier.pop(0)
 
@@ -336,7 +464,7 @@ def find_best_group(
                 set(),
             )
 
-            # Sort neighbours by physical distance.
+            # Nearby seats first.
             sorted_neighbours = sorted(
                 neighbours,
                 key=lambda seat_id: seat_distance(
@@ -350,7 +478,9 @@ def find_best_group(
                 if neighbour_id in visited:
                     continue
 
-                visited.add(neighbour_id)
+                visited.add(
+                    neighbour_id
+                )
 
                 group.append(
                     seat_by_id[neighbour_id]
@@ -372,8 +502,6 @@ def find_best_group(
 
     if not candidates:
 
-        # If no connected group exists, select the seats
-        # closest to the starting seat.
         for start_seat in available:
 
             others = [
@@ -397,7 +525,7 @@ def find_best_group(
             candidates.append(group)
 
     # -------------------------------------------------
-    # Find highest scoring group
+    # Find highest-scoring group
     # -------------------------------------------------
 
     best_group = max(
@@ -415,6 +543,10 @@ def find_best_group(
         ),
     )
 
+    # -------------------------------------------------
+    # Calculate final score
+    # -------------------------------------------------
+
     score = calculate_group_score(
         best_group,
         window=window,
@@ -427,9 +559,27 @@ def find_best_group(
         seater=seater,
     )
 
+    # -------------------------------------------------
+    # Analyze grouping
+    # -------------------------------------------------
+
+    grouping = analyze_group(
+        best_group
+    )
+
+    # -------------------------------------------------
+    # Final result
+    # -------------------------------------------------
+
     return {
         "success": True,
-        "score": round(score, 2),
+
+        "score": round(
+            score,
+            2,
+        ),
+
+        "passengers": passengers,
 
         "seat_ids": [
             seat["id"]
@@ -445,6 +595,8 @@ def find_best_group(
             seat["price"]
             for seat in best_group
         ),
+
+        "grouping": grouping,
 
         "seats": best_group,
     }
