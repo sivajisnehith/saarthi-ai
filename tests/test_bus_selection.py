@@ -11,19 +11,26 @@ from agent.agent import saarthi
 
 def main():
 
-    print("Saarthi group seating test...\n")
+    print("Saarthi bus selection test...\n")
 
     response = saarthi(
         """
+        Customer conversation:
+
+        Customer:
         I need to travel from Hyderabad to Vijayawada
         on 2026-09-18 for 4 passengers.
+        I want sleeper seats.
 
-        Find me suitable buses.
+        Saarthi:
+        [Search the buses and show me the available options.]
 
-        We are travelling together, so I want 4 seats
-        as close together as possible.
+        Customer:
+        I'll take Bus ID 11.
+        Now find the best 4 seats together for us.
 
-        Prefer sleeper seats.
+        Continue the conversation from here.
+        Use the appropriate tool to find the group seats.
         """
     )
 

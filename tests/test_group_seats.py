@@ -1,4 +1,11 @@
 import asyncio
+import sys
+from pathlib import Path
+
+# Add project root to sys.path so it works when run directly
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8")
 
 from integrations.snehith_client import SnehithClient
 from tools.seat_optimizer import find_best_group

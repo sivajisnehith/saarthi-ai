@@ -63,7 +63,18 @@ class SnehithClient:
                 headers=self._headers(),
             )
 
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            try:
+                err_body = response.text
+            except Exception:
+                err_body = ""
+            raise httpx.HTTPStatusError(
+                f"{e.args[0]} - Details: {err_body}",
+                request=e.request,
+                response=e.response,
+            ) from e
 
         return response.json()
 
@@ -83,7 +94,18 @@ class SnehithClient:
                 headers=self._headers(),
             )
 
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            try:
+                err_body = response.text
+            except Exception:
+                err_body = ""
+            raise httpx.HTTPStatusError(
+                f"{e.args[0]} - Details: {err_body}",
+                request=e.request,
+                response=e.response,
+            ) from e
 
         return response.json()
 
@@ -176,4 +198,60 @@ class SnehithClient:
             f"/api/buses/{bus_id}/recommend-seats",
             json=payload,
         )
-    
+    async def hold_seats(
+        self,
+        bus_id: int,
+        journey_date: str,
+        seat_ids: list[int],
+    ):
+        payload = {
+            "bus_id": bus_id,
+            "journey_date": journey_date,
+            "seat_ids": seat_ids,
+        }
+
+        return await self.post(
+            "/api/seats/hold",
+            json=payload,
+        )
+    async def create_booking(
+        self,
+        bus_id: int,
+        journey_date: str,
+        boarding_point: str,
+        dropping_point: str,
+        passengers: list[dict],
+        hold_token: str | None = None,
+    ):
+        normalized_passengers = []
+        gender_map = {
+            "m": "M",
+            "male": "M",
+            "f": "F",
+            "female": "F",
+            "other": "Other",
+            "o": "Other",
+        }
+        for p in passengers:
+            p_copy = dict(p)
+            if "gender" in p_copy and isinstance(p_copy["gender"], str):
+                normalized = gender_map.get(p_copy["gender"].strip().lower())
+                if normalized:
+                    p_copy["gender"] = normalized
+            normalized_passengers.append(p_copy)
+
+        payload = {
+            "bus_id": bus_id,
+            "journey_date": journey_date,
+            "boarding_point": boarding_point,
+            "dropping_point": dropping_point,
+            "passengers": normalized_passengers,
+        }
+
+        if hold_token:
+            payload["hold_token"] = hold_token
+
+        return await self.post(
+            "/api/bookings",
+            json=payload,
+        )

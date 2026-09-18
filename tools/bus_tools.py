@@ -246,3 +246,23 @@ async def find_group_seats(
     )
 
     return result
+@tool
+async def hold_seats(
+    bus_id: int,
+    journey_date: str,
+    seat_ids: list[int],
+) -> dict:
+    """
+    Temporarily hold selected seats for a booking.
+
+    The hold is created by Snehith Travels and returns a hold token
+    and expiry information.
+    """
+
+    result = await client.hold_seats(
+        bus_id=bus_id,
+        journey_date=journey_date,
+        seat_ids=seat_ids,
+    )
+
+    return result
