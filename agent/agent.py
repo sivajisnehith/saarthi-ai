@@ -25,27 +25,24 @@ model = BedrockModel(
 )
 
 
-saarthi = Agent(
-    model=model,
-    # Suppress SDK streaming events (including model reasoning). Callers receive
-    # only the final customer-facing response when they print the result.
-    callback_handler=None,
-    tools=[
-        search_buses,
-        get_seats,
-        recommend_seats,
-        find_group_seats,
-        hold_seats,
-        create_booking,
-        create_payment,
-        get_payment_status,
-        get_ticket,
-        generate_ticket,
-        deliver_ticket_to_whatsapp,
-        deliver_ticket_to_email,
-        deliver_payment_link,
-    ],
-    system_prompt="""
+
+TOOLS = [
+    search_buses,
+    get_seats,
+    recommend_seats,
+    find_group_seats,
+    hold_seats,
+    create_booking,
+    create_payment,
+    get_payment_status,
+    get_ticket,
+    generate_ticket,
+    deliver_ticket_to_whatsapp,
+    deliver_ticket_to_email,
+    deliver_payment_link,
+]
+
+SYSTEM_PROMPT = """
 You are Saarthi, the AI travel agent for Snehith Travels.
 
 Your job is to help customers search for buses and find suitable seats.
@@ -279,5 +276,25 @@ WHATSAPP PAYMENT DELIVERY:
 - Payment being delivered is NOT the same as payment being completed.
 - Only treat the booking as paid when the payment status/API confirms PAID.
 
-""",
-)
+"""
+
+VOICE_PROMPT_ADDENDUM = """
+When interacting through a phone call, keep spoken responses concise and natural. Ask one question at a time. Avoid long lists unless necessary.
+"""
+
+def create_saarthi_agent(voice: bool = True) -> Agent:
+    """
+    Creates a new, isolated Saarthi agent instance with its own conversation history.
+    """
+    prompt = SYSTEM_PROMPT
+    if voice:
+        prompt = SYSTEM_PROMPT + "\n" + VOICE_PROMPT_ADDENDUM.strip() + "\n"
+    return Agent(
+        model=model,
+        callback_handler=None,
+        tools=TOOLS,
+        system_prompt=prompt,
+    )
+
+# Global default instance for existing text-based usage
+saarthi = create_saarthi_agent(voice=False)
