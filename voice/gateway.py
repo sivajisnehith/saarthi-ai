@@ -24,14 +24,14 @@ logger = logging.getLogger("saarthi.voice")
 
 app = FastAPI(title="Saarthi Voice Gateway")
 
-SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
+from voice.key_manager import SarvamKeyManager, sarvam_key_manager
+from voice.time_formatter import format_time_for_speech, format_spoken_times
+from voice.telemetry import CallTelemetry, attach_strands_telemetry
+
 SARVAM_STT_MODEL = os.getenv("SARVAM_STT_MODEL", "saaras:v3-realtime")
 SARVAM_LANGUAGE_CODE = os.getenv("SARVAM_LANGUAGE_CODE", "en-IN")
 SARVAM_SAMPLE_RATE = int(os.getenv("SARVAM_SAMPLE_RATE", "8000"))
 SARVAM_STREAM_TYPE = os.getenv("SARVAM_STREAM_TYPE", "balanced")
-
-if not SARVAM_API_KEY:
-    raise RuntimeError("SARVAM_API_KEY is not configured")
 
 SARVAM_WS_BASE_URL = "wss://api.sarvam.ai/speech-to-text-realtime/ws"
 
@@ -40,9 +40,9 @@ INITIAL_GREETING_TEXT = (
     "Hi! I'm Saarthi, your travel assistant. How can I help you today?"
 )
 
-# Initialize reusable TTS service
+# Initialize reusable TTS service with fallback key manager
 tts_service = SarvamTTSService(
-    api_key=SARVAM_API_KEY,
+    key_manager=sarvam_key_manager,
     model="bulbul:v3",
     speaker="kavya",
     target_language_code="en-IN",
@@ -126,6 +126,60 @@ def sanitize_agent_text(text: str) -> str:
     return text
 
 
+def enforce_concise_voice_response(text: str, max_words: int = 50) -> str:
+    """
+    Defensive sentence-aware length safeguard for telephone voice responses.
+    Ensures spoken responses stay within a natural conversational duration (~5-15s),
+    preventing 100+ chunk TTS audio monologues while never truncating mid-sentence,
+    mid-word, mid-email, or mid-URL.
+    """
+    if not text:
+        return ""
+
+    # Normalize whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+    words = text.split()
+
+    # If within acceptable conversational word budget, return unchanged
+    if len(words) <= max_words:
+        return text
+
+    # Split into complete sentences based on punctuation (.!?)
+    sentence_pattern = r"(?<=[.!?])\s+"
+    sentences = [s.strip() for s in re.split(sentence_pattern, text) if s.strip()]
+
+    # If already 1 or 2 sentences, don't chop further unless excessively long
+    if len(sentences) <= 2 and len(words) <= max_words + 15:
+        return text
+
+    # If we have multiple sentences:
+    # Always keep sentence 0 (the primary statement / confirmation)
+    selected = [sentences[0]]
+
+    # Check if the final sentence is a question (the prompt for customer action)
+    last_sentence = sentences[-1]
+    last_is_question = last_sentence.endswith("?")
+
+    if last_is_question and len(sentences) > 1:
+        # Check if sentence 1 can also fit between sentence 0 and the question
+        if len(sentences) > 2:
+            candidate = f"{sentences[0]} {sentences[1]} {last_sentence}"
+            if len(candidate.split()) <= max_words:
+                selected.append(sentences[1])
+        selected.append(last_sentence)
+    else:
+        # Last sentence is not a question, pack first 2-3 complete sentences up to max_words
+        for s in sentences[1:]:
+            candidate = " ".join(selected + [s])
+            if len(candidate.split()) <= max_words:
+                selected.append(s)
+            else:
+                break
+
+    result = " ".join(selected).strip()
+    return result if result else text
+
+
 def extract_agent_response(agent_result: Any) -> str:
     """
     Extracts purely user-facing text from a Strands AgentResult or similar agent output.
@@ -178,6 +232,9 @@ def extract_agent_response(agent_result: Any) -> str:
     # 4. Primary fix: strip all internal reasoning, thought tags, and internal phrases
     clean_text = sanitize_agent_text(raw_text)
 
+    # 5. Defensive voice conciseness safeguard
+    clean_text = enforce_concise_voice_response(clean_text)
+
     return clean_text.strip()
 
 
@@ -197,6 +254,11 @@ def clean_text_for_tts(text: str) -> str:
     if not text:
         return ""
 
+    # Defensive voice conciseness safeguard
+    text = enforce_concise_voice_response(text)
+    if not text:
+        return ""
+
     # Remove code blocks and inline code
     text = re.sub(r"```[\s\S]*?```", "", text)
     text = re.sub(r"`([^`]+)`", r"\1", text)
@@ -207,8 +269,12 @@ def clean_text_for_tts(text: str) -> str:
     # Remove raw URLs
     text = re.sub(r"https?://\S+", "", text)
 
-    # Replace currency symbols
+    # Replace currency symbols: ???899 -> 899 rupees, ???1,099 -> 1,099 rupees
+    text = re.sub(r"\u20b9\s*([0-9]+(?:,[0-9]+)*(?:\.[0-9]+)?)", r"\1 rupees", text)
     text = text.replace("\u20b9", " rupees ")
+
+    # Format 24-hour departure/arrival times to natural 12-hour spoken format (e.g. 21:00 -> 9 PM)
+    text = format_spoken_times(text)
 
     # Remove markdown emphasis (bold, italics)
     text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
@@ -247,6 +313,8 @@ async def health():
         "model": SARVAM_STT_MODEL,
         "language_code": SARVAM_LANGUAGE_CODE,
         "sample_rate": SARVAM_SAMPLE_RATE,
+        "sarvam_keys_count": len(sarvam_key_manager.get_all_keys()),
+        "sarvam_active_key_index": sarvam_key_manager.get_current_index() + 1,
     }
 
 
@@ -256,12 +324,15 @@ async def voice_stream(websocket: WebSocket):
     logger.info("Exotel WebSocket connected")
 
     # Create an isolated Saarthi Agent for this specific phone call session
+    call_telemetry = CallTelemetry()
     call_agent = create_saarthi_agent(voice=True)
+    attach_strands_telemetry(call_agent, call_telemetry, lambda: current_turn_id)
     logger.info("Initialized per-call Saarthi agent | session_id=%s", call_agent.session_id)
 
     sarvam_ws = None
     sarvam_recv_task = None
     agent_task = None
+    tts_task = None
     greeting_task = None
 
     stream_sid = None
@@ -271,15 +342,51 @@ async def voice_stream(websocket: WebSocket):
     greeting_started = False
     send_lock = asyncio.Lock()
 
-    async def play_tts_response(response_text: str, sid: str):
-        nonlocal exotel_chunk_counter
+    # Per-call barge-in and playback control state
+    current_turn_id = 0
+    playback_active = False
+    playback_cancel_event = asyncio.Event()
+
+    def cancel_active_playback(source: str = "barge-in"):
+        nonlocal playback_active
+        is_greeting = greeting_task is not None and not greeting_task.done()
+        is_tts = tts_task is not None and not tts_task.done()
+        if playback_active or is_greeting or is_tts:
+            logger.info("Customer barge-in detected — cancelling TTS")
+            playback_cancel_event.set()
+            playback_active = False
+            if tts_task and not tts_task.done():
+                tts_task.cancel()
+            if greeting_task and not greeting_task.done():
+                greeting_task.cancel()
+
+    async def play_tts_response(response_text: str, sid: str, turn_id: int):
+        nonlocal exotel_chunk_counter, playback_active
+        if not session_active:
+            return
+
+        if turn_id != current_turn_id or playback_cancel_event.is_set():
+            logger.info("Discarding stale Saarthi response for turn %s", turn_id)
+            return
+
         try:
             logger.info("SAARTHI TTS INPUT: %s", response_text)
             logger.info("Generating TTS response...")
+            call_telemetry.on_tts_start(turn_id)
             pcm_data = await tts_service.synthesize(response_text)
             if not pcm_data:
                 return
 
+            call_telemetry.on_tts_audio_ready(turn_id, len(pcm_data))
+
+            if turn_id != current_turn_id or playback_cancel_event.is_set() or not session_active:
+                logger.info("Discarding stale Saarthi response for turn %s", turn_id)
+                return
+
+            playback_active = True
+            interrupted = False
+            first_chunk_sent = False
+            logger.info("TTS playback started")
             logger.info("TTS generated successfully | bytes=%d", len(pcm_data))
 
             chunk_size = 1600  # 100 ms of 8000 Hz, 16-bit mono PCM (multiple of 320)
@@ -289,6 +396,11 @@ async def voice_stream(websocket: WebSocket):
             for i in range(0, len(pcm_data), chunk_size):
                 if not session_active:
                     logger.info("Session ended, stopping TTS playback")
+                    interrupted = True
+                    break
+
+                if playback_cancel_event.is_set() or turn_id != current_turn_id:
+                    interrupted = True
                     break
 
                 chunk = pcm_data[i : i + chunk_size]
@@ -307,70 +419,105 @@ async def voice_stream(websocket: WebSocket):
                 }
 
                 async with send_lock:
-                    if session_active:
+                    if session_active and not playback_cancel_event.is_set() and turn_id == current_turn_id:
                         await websocket.send_text(json.dumps(media_msg))
+                        if not first_chunk_sent:
+                            first_chunk_sent = True
+                            call_telemetry.on_first_chunk_sent(turn_id)
+                    else:
+                        interrupted = True
+                        break
 
                 # Real-time pacing (~100 ms per 1600 bytes)
                 await asyncio.sleep(len(chunk) / 16000.0)
 
-            if session_active:
-                logger.info("TTS playback sent")
+            if interrupted:
+                logger.info("TTS playback interrupted")
+                call_telemetry.on_turn_interrupted(turn_id, "barge-in")
+            else:
+                logger.info("TTS playback completed")
+                call_telemetry.on_last_chunk_sent(turn_id, total_chunks)
 
         except asyncio.CancelledError:
-            logger.info("TTS playback cancelled")
+            logger.info("TTS playback interrupted")
         except Exception:
             logger.exception("Error during TTS generation or playback")
+        finally:
+            playback_active = False
 
-    async def play_initial_greeting(sid: str):
+    async def play_initial_greeting(sid: str, turn_id: int):
+        nonlocal playback_active
         try:
             logger.info("Saarthi initial greeting starting...")
             logger.info("SAARTHI GREETING: %s", INITIAL_GREETING_TEXT)
-            await play_tts_response(INITIAL_GREETING_TEXT, sid)
-            if session_active:
+            await play_tts_response(INITIAL_GREETING_TEXT, sid, turn_id)
+            if session_active and not playback_cancel_event.is_set() and turn_id == current_turn_id:
                 logger.info("Initial greeting playback completed")
         except asyncio.CancelledError:
-            logger.info("Initial greeting playback cancelled")
+            logger.info("TTS playback interrupted")
         except Exception:
             logger.exception("Error during initial greeting playback")
 
-    async def handle_agent_and_tts(customer_text: str, sid: str):
+    async def handle_agent_and_tts(customer_text: str, sid: str, turn_id: int):
+        nonlocal tts_task
         try:
-            logger.info("Saarthi agent processing...")
+            logger.info("Saarthi agent processing | turn=%s...", turn_id)
+            call_telemetry.on_agent_start(turn_id)
             try:
                 agent_result = await asyncio.wait_for(
                     call_agent.invoke_async(customer_text),
                     timeout=25.0,
                 )
+                if getattr(agent_result, "stop_reason", None) == "cancelled":
+                    logger.info("Agent invocation cancelled for turn %s", turn_id)
+                    return
                 raw_response = extract_agent_response(agent_result)
+                call_telemetry.on_agent_end(turn_id, raw_response)
+            except asyncio.CancelledError:
+                logger.info("Agent task cancelled for turn %s", turn_id)
+                return
             except asyncio.TimeoutError:
-                logger.warning("Agent invocation timed out")
+                logger.warning("Agent invocation timed out for turn %s", turn_id)
                 raw_response = "Sorry, I took a little too long to respond. Could you please say that again?"
             except Exception:
-                logger.exception("Agent invocation failed")
+                logger.exception("Agent invocation failed for turn %s", turn_id)
                 raw_response = "Sorry, I had trouble processing that. Could you please say that again?"
+
+            if turn_id != current_turn_id or playback_cancel_event.is_set():
+                logger.info("Discarding stale Saarthi response for turn %s", turn_id)
+                return
 
             if not raw_response:
                 raw_response = "Sorry, I didn't catch that. Could you please say that again?"
 
             logger.info("SAARTHI SAID: %s", raw_response)
 
-            if not session_active:
-                logger.info("Session ended during agent processing, aborting TTS")
+            if not session_active or turn_id != current_turn_id or playback_cancel_event.is_set():
+                logger.info("Discarding stale Saarthi response for turn %s", turn_id)
                 return
 
             tts_text = clean_text_for_tts(raw_response)
             if not tts_text:
                 return
 
-            await play_tts_response(tts_text, sid)
+            if turn_id != current_turn_id or playback_cancel_event.is_set():
+                logger.info("Discarding stale Saarthi response for turn %s", turn_id)
+                return
+
+            if tts_task and not tts_task.done():
+                tts_task.cancel()
+
+            playback_cancel_event.clear()
+            tts_task = asyncio.create_task(play_tts_response(tts_text, sid, turn_id))
+            await tts_task
 
         except asyncio.CancelledError:
-            logger.info("Agent/TTS task cancelled")
+            logger.info("Agent/TTS task cancelled for turn %s", turn_id)
         except Exception:
-            logger.exception("Error in agent/TTS handler")
+            logger.exception("Error in agent/TTS handler for turn %s", turn_id)
 
     async def sarvam_receiver(ws):
-        nonlocal agent_task
+        nonlocal agent_task, current_turn_id, playback_cancel_event
         try:
             async for message in ws:
                 try:
@@ -387,6 +534,11 @@ async def voice_stream(websocket: WebSocket):
                         "Sarvam STT: Speech started (utterance %s)",
                         data.get("utterance_idx"),
                     )
+                    call_telemetry.on_speech_start(data.get("utterance_idx"))
+                    # Barge-in: immediate cancellation of active TTS playback
+                    cancel_active_playback("vad.speech_start")
+                    # Increment conversational turn ID so any in-flight response becomes stale
+                    current_turn_id += 1
                 elif event == "transcript.partial":
                     text = data.get("text", "").strip()
                     if text:
@@ -396,6 +548,7 @@ async def voice_stream(websocket: WebSocket):
                         "Sarvam STT: Speech ended (utterance %s)",
                         data.get("utterance_idx"),
                     )
+                    call_telemetry.on_speech_end(data.get("utterance_idx"))
                 elif event == "transcript.final":
                     text = data.get("text", "").strip()
                     if text:
@@ -403,22 +556,31 @@ async def voice_stream(websocket: WebSocket):
                         logger.info("CUSTOMER STT: %s", text)
                         # Process through Saarthi Strands agent -> TTS -> Exotel
                         if stream_sid and session_active:
-                            is_greeting_playing = (
-                                greeting_task is not None and not greeting_task.done()
+                            # If audio was still playing, cancel immediately
+                            cancel_active_playback("transcript.final")
+                            current_turn_id += 1
+
+                            # Clear cancel event for the new turn
+                            playback_cancel_event.clear()
+
+                            # If a previous agent invocation is still running, cancel it
+                            if agent_task and not agent_task.done():
+                                logger.info("Cancelling previous agent invocation before starting new turn...")
+                                call_agent.cancel()
+                                agent_task.cancel()
+                                await asyncio.sleep(0.01)
+
+                            assigned_turn = current_turn_id
+                            call_telemetry.on_transcript_final(assigned_turn, text)
+                            agent_task = asyncio.create_task(
+                                handle_agent_and_tts(text, stream_sid, assigned_turn)
                             )
-                            is_agent_playing = (
-                                agent_task is not None and not agent_task.done()
-                            )
-                            if is_greeting_playing or is_agent_playing:
-                                logger.info(
-                                    "Agent/TTS playback already in progress, skipping overlapping utterance"
-                                )
-                            else:
-                                agent_task = asyncio.create_task(
-                                    handle_agent_and_tts(text, stream_sid)
-                                )
                 elif event == "error":
                     logger.error("Sarvam STT error: %s", data)
+                    err_msg = str(data.get("message", "")).lower()
+                    if any(term in err_msg for term in ["credit", "quota", "balance", "unauthorized", "forbidden", "insufficient", "payment"]):
+                        active_k = sarvam_key_manager.get_current_key()
+                        sarvam_key_manager.mark_key_exhausted(active_k, reason=f"STT error event: {err_msg[:80]}")
                 elif event == "session.end":
                     logger.info("Sarvam STT session ended: %s", data)
         except asyncio.CancelledError:
@@ -430,14 +592,40 @@ async def voice_stream(websocket: WebSocket):
 
     try:
         sarvam_url = get_sarvam_ws_url()
-        headers = {"api-subscription-key": SARVAM_API_KEY}
-        logger.info("Connecting to Sarvam Realtime STT: %s", sarvam_url)
-        try:
-            sarvam_ws = await websockets.connect(sarvam_url, additional_headers=headers)
-            logger.info("Sarvam STT connected")
-            sarvam_recv_task = asyncio.create_task(sarvam_receiver(sarvam_ws))
-        except Exception:
-            logger.exception("Failed to connect to Sarvam Realtime STT")
+        total_keys = len(sarvam_key_manager.get_all_keys())
+        for attempt in range(total_keys):
+            active_key = sarvam_key_manager.get_current_key()
+            headers = {"api-subscription-key": active_key}
+            logger.info(
+                "Connecting to Sarvam Realtime STT (key #%d/%d %s)...",
+                sarvam_key_manager.get_current_index() + 1,
+                total_keys,
+                sarvam_key_manager.mask_key(active_key),
+            )
+            try:
+                sarvam_ws = await websockets.connect(sarvam_url, additional_headers=headers)
+                logger.info("Sarvam STT connected successfully")
+                sarvam_recv_task = asyncio.create_task(sarvam_receiver(sarvam_ws))
+                break
+            except websockets.exceptions.InvalidStatusCode as e:
+                logger.warning(
+                    "Sarvam STT WebSocket handshake failed with HTTP %s (Key #%d %s)",
+                    e.status_code,
+                    sarvam_key_manager.get_current_index() + 1,
+                    sarvam_key_manager.mask_key(active_key),
+                )
+                if e.status_code in (401, 402, 403, 429) and total_keys > 1:
+                    sarvam_key_manager.mark_key_exhausted(active_key, reason=f"WS Handshake HTTP {e.status_code}")
+                    continue
+                else:
+                    logger.exception("Failed to connect to Sarvam Realtime STT")
+                    break
+            except Exception:
+                logger.exception("Failed to connect to Sarvam Realtime STT")
+                if total_keys > 1 and attempt < total_keys - 1:
+                    sarvam_key_manager.mark_key_exhausted(active_key, reason="WS Connection failed")
+                    continue
+                break
 
         while True:
             message = await websocket.receive_text()
@@ -454,14 +642,20 @@ async def voice_stream(websocket: WebSocket):
 
             elif event == "start":
                 start_data = data.get("start", {})
-                stream_sid = data.get("stream_sid") or start_data.get("stream_sid")
+                stream_sid = data.get("stream_sid") or start_data.get("stream_sid") or data.get("streamSid") or start_data.get("streamSid")
                 caller = start_data.get("from")
+                call_sid = start_data.get("call_sid") or start_data.get("callSid")
+                call_telemetry.stream_sid = stream_sid
+                call_telemetry.call_sid = call_sid
                 logger.info("Exotel media stream started | SID=%s | Caller=%s", stream_sid, caller)
 
                 # Immediately trigger initial greeting (once per call)
                 if not greeting_started and stream_sid and session_active:
                     greeting_started = True
-                    greeting_task = asyncio.create_task(play_initial_greeting(stream_sid))
+                    current_turn_id += 1
+                    greeting_turn = current_turn_id
+                    playback_cancel_event.clear()
+                    greeting_task = asyncio.create_task(play_initial_greeting(stream_sid, greeting_turn))
 
             elif event == "media":
                 media = data.get("media", {})
@@ -491,6 +685,15 @@ async def voice_stream(websocket: WebSocket):
 
     finally:
         session_active = False
+        playback_cancel_event.set()
+        call_telemetry.end_call()
+
+        if tts_task and not tts_task.done():
+            tts_task.cancel()
+            try:
+                await tts_task
+            except asyncio.CancelledError:
+                pass
 
         if greeting_task and not greeting_task.done():
             greeting_task.cancel()

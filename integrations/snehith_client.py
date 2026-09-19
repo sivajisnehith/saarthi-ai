@@ -1,3 +1,5 @@
+import logging
+import time
 import httpx
 
 from config.settings import (
@@ -56,12 +58,15 @@ class SnehithClient:
 
         url = f"{self.base_url}{path}"
 
+        t0 = time.perf_counter()
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(
                 url,
                 params=params,
                 headers=self._headers(),
             )
+        duration_ms = (time.perf_counter() - t0) * 1000
+        logger.info("Snehith API GET %s | duration_ms=%.1f | status=%s", path, duration_ms, response.status_code)
 
         try:
             response.raise_for_status()
@@ -87,12 +92,15 @@ class SnehithClient:
 
         url = f"{self.base_url}{path}"
 
+        t0 = time.perf_counter()
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 url,
                 json=json,
                 headers=self._headers(),
             )
+        duration_ms = (time.perf_counter() - t0) * 1000
+        logger.info("Snehith API POST %s | duration_ms=%.1f | status=%s", path, duration_ms, response.status_code)
 
         try:
             response.raise_for_status()
@@ -312,3 +320,4 @@ class SnehithClient:
             "/api/payments/deliver-link",
             json=payload,
         )
+logger = logging.getLogger('saarthi.integrations.snehith')
