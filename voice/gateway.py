@@ -34,6 +34,11 @@ if not SARVAM_API_KEY:
 
 SARVAM_WS_BASE_URL = "wss://api.sarvam.ai/speech-to-text-realtime/ws"
 
+# Exact initial greeting text
+INITIAL_GREETING_TEXT = (
+    "Hi! I'm Saarthi, your travel assistant. How can I help you today?"
+)
+
 # Initialize reusable TTS service
 tts_service = SarvamTTSService(
     api_key=SARVAM_API_KEY,
@@ -119,11 +124,13 @@ async def voice_stream(websocket: WebSocket):
     sarvam_ws = None
     sarvam_recv_task = None
     agent_task = None
+    greeting_task = None
 
     stream_sid = None
     caller = None
     exotel_chunk_counter = 0
     session_active = True
+    greeting_started = False
     send_lock = asyncio.Lock()
 
     async def play_tts_response(response_text: str, sid: str):
@@ -174,6 +181,18 @@ async def voice_stream(websocket: WebSocket):
             logger.info("TTS playback cancelled")
         except Exception:
             logger.exception("Error during TTS generation or playback")
+
+    async def play_initial_greeting(sid: str):
+        try:
+            logger.info("Saarthi initial greeting starting...")
+            logger.info("SAARTHI GREETING: %s", INITIAL_GREETING_TEXT)
+            await play_tts_response(INITIAL_GREETING_TEXT, sid)
+            if session_active:
+                logger.info("Initial greeting playback completed")
+        except asyncio.CancelledError:
+            logger.info("Initial greeting playback cancelled")
+        except Exception:
+            logger.exception("Error during initial greeting playback")
 
     async def handle_agent_and_tts(customer_text: str, sid: str):
         try:
@@ -244,9 +263,15 @@ async def voice_stream(websocket: WebSocket):
                         logger.info("CUSTOMER SAID: %s", text)
                         # Process through Saarthi Strands agent -> TTS -> Exotel
                         if stream_sid and session_active:
-                            if agent_task is not None and not agent_task.done():
+                            is_greeting_playing = (
+                                greeting_task is not None and not greeting_task.done()
+                            )
+                            is_agent_playing = (
+                                agent_task is not None and not agent_task.done()
+                            )
+                            if is_greeting_playing or is_agent_playing:
                                 logger.info(
-                                    "Agent/TTS task already in progress, skipping overlapping utterance"
+                                    "Agent/TTS playback already in progress, skipping overlapping utterance"
                                 )
                             else:
                                 agent_task = asyncio.create_task(
@@ -293,6 +318,11 @@ async def voice_stream(websocket: WebSocket):
                 caller = start_data.get("from")
                 logger.info("Exotel media stream started | SID=%s | Caller=%s", stream_sid, caller)
 
+                # Immediately trigger initial greeting (once per call)
+                if not greeting_started and stream_sid and session_active:
+                    greeting_started = True
+                    greeting_task = asyncio.create_task(play_initial_greeting(stream_sid))
+
             elif event == "media":
                 media = data.get("media", {})
                 payload = media.get("payload")
@@ -321,6 +351,13 @@ async def voice_stream(websocket: WebSocket):
 
     finally:
         session_active = False
+
+        if greeting_task and not greeting_task.done():
+            greeting_task.cancel()
+            try:
+                await greeting_task
+            except asyncio.CancelledError:
+                pass
 
         if agent_task and not agent_task.done():
             agent_task.cancel()
