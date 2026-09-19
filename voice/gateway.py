@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+from typing import Any
 from urllib.parse import urlencode
 
 from dotenv import load_dotenv
@@ -50,12 +51,149 @@ tts_service = SarvamTTSService(
 )
 
 
+INTERNAL_TAGS = [
+    "reasoning",
+    "thought",
+    "think",
+    "analysis",
+    "internal",
+    "tool",
+    "tool_call",
+    "tool_response",
+    "tool_selection",
+    "scratchpad",
+    "planning",
+    "plan",
+    "reflection",
+    "decision",
+    "system",
+    "instruction",
+]
+
+INTERNAL_PHRASES = [
+    r"waiting for (?:your )?confirmation",
+    r"waiting for user confirmation",
+    r"waiting for the user to confirm",
+    r"internal decision making:?",
+    r"tool-selection reasoning:?",
+    r"chain-of-thought:?",
+    r"internal planning:?",
+]
+
+
+def sanitize_agent_text(text: str) -> str:
+    """
+    Defensively strips reasoning tags, chain-of-thought, internal planning,
+    and developer/tool artifacts from text.
+    """
+    if not text:
+        return ""
+
+    # 1. Strip paired internal tags (e.g. <reasoning>...</reasoning>)
+    for tag in INTERNAL_TAGS:
+        pattern = rf"<{tag}\b[^>]*>.*?</{tag}>"
+        text = re.sub(pattern, "", text, flags=re.DOTALL | re.IGNORECASE)
+
+    # 2. Strip unclosed opening tags at beginning of text
+    for tag in INTERNAL_TAGS:
+        pattern = rf"^\s*<{tag}\b[^>]*>.*?(?=\n\n|\Z)"
+        text = re.sub(pattern, "", text, flags=re.DOTALL | re.IGNORECASE)
+
+    # 3. Strip trailing unclosed opening tags
+    for tag in INTERNAL_TAGS:
+        pattern = rf"<{tag}\b[^>]*>.*$"
+        text = re.sub(pattern, "", text, flags=re.DOTALL | re.IGNORECASE)
+
+    # 4. Strip stray closing tags (e.g. </reasoning>)
+    for tag in INTERNAL_TAGS:
+        text = re.sub(rf"</{tag}>", "", text, flags=re.IGNORECASE)
+
+    # 5. Strip internal status phrases
+    for phrase in INTERNAL_PHRASES:
+        text = re.sub(rf"(?i)\b{phrase}\b[.:]?", "", text)
+
+    # 6. Strip markdown code blocks of tool calls / json payloads
+    text = re.sub(
+        r"```(?:json|tool|tool_call)?\s*[\{\[].*?[\}\]]\s*```",
+        "",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    # 7. Normalize whitespace
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n", "\n", text).strip()
+    return text
+
+
+def extract_agent_response(agent_result: Any) -> str:
+    """
+    Extracts purely user-facing text from a Strands AgentResult or similar agent output.
+    Explicitly filters out:
+    - reasoningContent blocks
+    - toolUse / toolResult blocks
+    - internal tags (<reasoning>, <thought>, <analysis>, <tool>, etc.)
+    - internal status phrases (e.g. 'Waiting for your confirmation')
+    """
+    if agent_result is None:
+        return ""
+
+    raw_text = ""
+
+    # 1. Inspect message dict from AgentResult
+    message = getattr(agent_result, "message", None)
+    if isinstance(message, dict):
+        content = message.get("content", [])
+        if isinstance(content, list):
+            text_blocks = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                # Never include reasoningContent, toolUse, or toolResult in customer text
+                if "reasoningContent" in item or "toolUse" in item or "toolResult" in item:
+                    continue
+                if "text" in item and isinstance(item["text"], str):
+                    text_blocks.append(item["text"])
+                elif "citationsContent" in item and isinstance(item["citationsContent"], dict):
+                    c_content = item["citationsContent"].get("content", [])
+                    for sub in c_content:
+                        if isinstance(sub, dict) and "text" in sub:
+                            text_blocks.append(sub["text"])
+            if text_blocks:
+                raw_text = "\n".join(text_blocks)
+
+    # 2. Check structured_output if present and no text yet
+    if not raw_text:
+        structured = getattr(agent_result, "structured_output", None)
+        if structured:
+            if hasattr(structured, "model_dump_json"):
+                raw_text = structured.model_dump_json()
+            else:
+                raw_text = str(structured)
+
+    # 3. Fallback to str(agent_result) if still empty
+    if not raw_text:
+        raw_text = str(agent_result) if agent_result else ""
+
+    # 4. Primary fix: strip all internal reasoning, thought tags, and internal phrases
+    clean_text = sanitize_agent_text(raw_text)
+
+    return clean_text.strip()
+
+
 def clean_text_for_tts(text: str) -> str:
     """
-    Lightweight text normalization for TTS playback:
-    Strips markdown code blocks, links, headers, asterisks, bullet points,
-    and converts currency symbols to natural speech.
+    Text normalization for TTS playback:
+    1. Defensive safety filter: strips reasoning tags, internal thought markers,
+       tool calls, and status messages.
+    2. Strips markdown code blocks, links, headers, asterisks, bullet points.
+    3. Converts currency symbols to natural speech.
     """
+    if not text:
+        return ""
+
+    # Defensive safety filter (last line of protection)
+    text = sanitize_agent_text(text)
     if not text:
         return ""
 
@@ -70,7 +208,7 @@ def clean_text_for_tts(text: str) -> str:
     text = re.sub(r"https?://\S+", "", text)
 
     # Replace currency symbols
-    text = text.replace("?", " rupees ")
+    text = text.replace("\u20b9", " rupees ")
 
     # Remove markdown emphasis (bold, italics)
     text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
@@ -136,6 +274,7 @@ async def voice_stream(websocket: WebSocket):
     async def play_tts_response(response_text: str, sid: str):
         nonlocal exotel_chunk_counter
         try:
+            logger.info("SAARTHI TTS INPUT: %s", response_text)
             logger.info("Generating TTS response...")
             pcm_data = await tts_service.synthesize(response_text)
             if not pcm_data:
@@ -202,7 +341,7 @@ async def voice_stream(websocket: WebSocket):
                     call_agent.invoke_async(customer_text),
                     timeout=25.0,
                 )
-                raw_response = str(agent_result).strip()
+                raw_response = extract_agent_response(agent_result)
             except asyncio.TimeoutError:
                 logger.warning("Agent invocation timed out")
                 raw_response = "Sorry, I took a little too long to respond. Could you please say that again?"
@@ -261,6 +400,7 @@ async def voice_stream(websocket: WebSocket):
                     text = data.get("text", "").strip()
                     if text:
                         logger.info("CUSTOMER SAID: %s", text)
+                        logger.info("CUSTOMER STT: %s", text)
                         # Process through Saarthi Strands agent -> TTS -> Exotel
                         if stream_sid and session_active:
                             is_greeting_playing = (

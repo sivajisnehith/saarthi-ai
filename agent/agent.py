@@ -280,6 +280,7 @@ WHATSAPP PAYMENT DELIVERY:
 
 VOICE_PROMPT_ADDENDUM = """
 When interacting through a phone call, keep spoken responses concise and natural. Ask one question at a time. Avoid long lists unless necessary.
+CRITICAL VOICE RULE: Never output <reasoning>, <thought>, or any internal thinking tags or chain-of-thought in your response. Output only the final conversational message that the caller should hear.
 """
 
 def create_saarthi_agent(voice: bool = True) -> Agent:
