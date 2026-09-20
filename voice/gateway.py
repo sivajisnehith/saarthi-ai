@@ -14,6 +14,7 @@ import websockets
 from agent.agent import create_saarthi_agent
 from voice.tts import SarvamTTSService
 from voice.streaming_tts import SarvamStreamingTTSService
+from voice.audio_coordinator import AudioPlaybackCoordinator
 
 load_dotenv()
 
@@ -125,6 +126,7 @@ async def voice_stream(websocket: WebSocket):
     tts_task = None
     greeting_task = None
     progress_tts_task = None
+    progress_generation_id = None
     progress_first_chunk_sent = False
 
     stream_sid = None
@@ -133,6 +135,7 @@ async def voice_stream(websocket: WebSocket):
     session_active = True
     greeting_started = False
     send_lock = asyncio.Lock()
+    audio_coordinator = AudioPlaybackCoordinator()
 
     # Per-call barge-in and playback control state
     current_turn_id = 0
@@ -144,10 +147,12 @@ async def voice_stream(websocket: WebSocket):
         is_greeting = greeting_task is not None and not greeting_task.done()
         is_tts = tts_task is not None and not tts_task.done()
         is_progress = progress_tts_task is not None and not progress_tts_task.done()
-        if playback_active or is_greeting or is_tts or is_progress:
+        is_coord_holding = audio_coordinator.current_holder_type is not None
+        if playback_active or is_greeting or is_tts or is_progress or is_coord_holding:
             logger.info("Customer barge-in detected – cancelling TTS (%s)", source)
             playback_cancel_event.set()
             playback_active = False
+            audio_coordinator.cancel_active_playback(source)
             if tts_task and not tts_task.done():
                 tts_task.cancel()
             if progress_tts_task and not progress_tts_task.done():
@@ -156,7 +161,7 @@ async def voice_stream(websocket: WebSocket):
                 greeting_task.cancel()
 
     async def on_tool_progress(tool_name: str, turn_id: Optional[int] = None):
-        nonlocal stream_sid, session_active, playback_cancel_event, progress_tts_task, progress_first_chunk_sent
+        nonlocal stream_sid, session_active, playback_cancel_event, progress_tts_task, progress_first_chunk_sent, progress_generation_id
         if turn_id is None:
             turn_id = current_turn_id
         if not session_active or playback_cancel_event.is_set() or not stream_sid:
@@ -175,10 +180,30 @@ async def voice_stream(websocket: WebSocket):
             progress_msg,
             turn_id,
         )
+
+        # If previous progress task was still active, cancel cleanly before new stage
+        if progress_tts_task and not progress_tts_task.done():
+            if progress_generation_id:
+                audio_coordinator.cancel_generation(turn_id, progress_generation_id, "progress")
+            progress_tts_task.cancel()
+            try:
+                await progress_tts_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
         progress_first_chunk_sent = False
+        progress_generation_id = audio_coordinator.new_generation("progress", turn_id)
         progress_tts_task = asyncio.create_task(
-            play_tts_response(progress_msg, stream_sid, turn_id, is_progress=True)
+            play_tts_response(
+                progress_msg,
+                stream_sid,
+                turn_id,
+                playback_type="progress",
+                generation_id=progress_generation_id,
+                is_progress=True,
+            )
         )
+        audio_coordinator.register_task(progress_tts_task)
 
     attach_strands_telemetry(
         call_agent,
@@ -189,220 +214,265 @@ async def voice_stream(websocket: WebSocket):
     set_active_progress_callback(on_tool_progress)
     logger.info("Initialized per-call Saarthi agent | session_id=%s", call_agent.session_id)
 
-    async def play_tts_response(response_text: str, sid: str, turn_id: int, is_progress: bool = False):
+    async def play_tts_response(
+        response_text: str,
+        sid: str,
+        turn_id: int,
+        playback_type: str = "final",
+        generation_id: Optional[int] = None,
+        is_progress: bool = False,
+    ):
         nonlocal exotel_chunk_counter, playback_active, progress_first_chunk_sent
         if not session_active:
             return
+
+        if is_progress:
+            playback_type = "progress"
+
+        if generation_id is None:
+            generation_id = audio_coordinator.new_generation(playback_type, turn_id)
 
         if turn_id != current_turn_id or playback_cancel_event.is_set():
             logger.info("Discarding stale Saarthi response for turn %s", turn_id)
             return
 
+        if not audio_coordinator.is_generation_active(turn_id, generation_id):
+            if audio_coordinator.is_stale(turn_id, generation_id):
+                logger.info("AUDIO STALE DROP: %s turn=%s", playback_type, turn_id)
+            return
+
         try:
-            logger.info("SAARTHI TTS INPUT%s: %s", " (PROGRESS)" if is_progress else "", response_text)
-            logger.info("Generating TTS response...")
-            if not is_progress:
-                call_telemetry.on_tts_start(turn_id)
-
-            playback_active = True
-            interrupted = False
-            first_chunk_sent = False
-            total_chunks = 0
-            chunk_size = 1600  # 100 ms of 8000 Hz, 16-bit mono PCM (multiple of 320)
-            buffer = bytearray()
-            total_pcm_bytes = 0
-            stream_failed = False
-            target_lang = detect_response_language(response_text)
-
-            # Primary path: Sarvam Streaming TTS
-            try:
-                logger.info("Starting Sarvam Streaming TTS (turn %s, lang=%s)...", turn_id, target_lang)
-                async for pcm_chunk in streaming_tts_service.stream_pcm_chunks(
-                    response_text,
-                    cancel_event=playback_cancel_event,
-                    language_code=target_lang,
-                ):
-                    if not session_active or playback_cancel_event.is_set() or turn_id != current_turn_id:
-                        interrupted = True
-                        break
-
-                    if not first_chunk_sent and len(pcm_chunk) > 0 and not is_progress:
-                        call_telemetry.on_tts_audio_ready(turn_id, len(pcm_chunk))
-
-                    buffer.extend(pcm_chunk)
-                    total_pcm_bytes += len(pcm_chunk)
-
-                    # Progressive forward to Exotel
-                    while len(buffer) >= chunk_size:
-                        if not session_active or playback_cancel_event.is_set() or turn_id != current_turn_id:
-                            interrupted = True
-                            break
-
-                        chunk = bytes(buffer[:chunk_size])
-                        del buffer[:chunk_size]
-
-                        exotel_chunk_counter += 1
-                        total_chunks += 1
-                        timestamp_ms = int(total_chunks * 100)
-
-                        payload_b64 = base64.b64encode(chunk).decode("ascii")
-                        media_msg = {
-                            "event": "media",
-                            "stream_sid": sid,
-                            "media": {
-                                "chunk": str(exotel_chunk_counter),
-                                "timestamp": str(timestamp_ms),
-                                "payload": payload_b64,
-                            },
-                        }
-
-                        async with send_lock:
-                            if session_active and not playback_cancel_event.is_set() and turn_id == current_turn_id:
-                                await websocket.send_text(json.dumps(media_msg))
-                                if not first_chunk_sent:
-                                    first_chunk_sent = True
-                                    if is_progress:
-                                        progress_first_chunk_sent = True
-                                        logger.info("PROGRESS TTS FIRST AUDIO (turn %s)", turn_id)
-                                    else:
-                                        logger.info("TTS playback started (streaming)")
-                                        call_telemetry.on_first_chunk_sent(turn_id)
-                            else:
-                                interrupted = True
-                                break
-
-                        # Real-time pacing (~100 ms per 1600 bytes)
-                        await asyncio.sleep(len(chunk) / 16000.0)
-
-                    if interrupted:
-                        break
-
-                # Stream completed naturally; flush remaining buffered audio
-                if not interrupted and session_active and not playback_cancel_event.is_set() and turn_id == current_turn_id:
-                    call_telemetry.on_tts_stream_complete(turn_id, total_pcm_bytes)
-                    while len(buffer) > 0:
-                        if not session_active or playback_cancel_event.is_set() or turn_id != current_turn_id:
-                            interrupted = True
-                            break
-
-                        chunk = bytes(buffer[:chunk_size])
-                        del buffer[:chunk_size]
-
-                        exotel_chunk_counter += 1
-                        total_chunks += 1
-                        timestamp_ms = int(total_chunks * 100)
-
-                        payload_b64 = base64.b64encode(chunk).decode("ascii")
-                        media_msg = {
-                            "event": "media",
-                            "stream_sid": sid,
-                            "media": {
-                                "chunk": str(exotel_chunk_counter),
-                                "timestamp": str(timestamp_ms),
-                                "payload": payload_b64,
-                            },
-                        }
-
-                        async with send_lock:
-                            if session_active and not playback_cancel_event.is_set() and turn_id == current_turn_id:
-                                await websocket.send_text(json.dumps(media_msg))
-                                if not first_chunk_sent:
-                                    first_chunk_sent = True
-                                    if is_progress:
-                                        progress_first_chunk_sent = True
-                                        logger.info("PROGRESS TTS FIRST AUDIO (turn %s)", turn_id)
-                                    else:
-                                        logger.info("TTS playback started (streaming)")
-                                        call_telemetry.on_first_chunk_sent(turn_id)
-                            else:
-                                interrupted = True
-                                break
-
-                        await asyncio.sleep(len(chunk) / 16000.0)
-
-            except Exception as stream_err:
-                if not first_chunk_sent:
-                    logger.warning(
-                        "Streaming TTS failed before sending audio, falling back to REST TTS: %s",
-                        stream_err,
-                    )
-                    stream_failed = True
-                else:
-                    logger.error("Streaming TTS error during playback: %s", stream_err)
-                    interrupted = True
-
-            # Fallback path: If streaming TTS failed before any chunk was sent to Exotel
-            if (
-                stream_failed
-                and not interrupted
-                and session_active
-                and not playback_cancel_event.is_set()
-                and turn_id == current_turn_id
-            ):
-                logger.info("Executing REST TTS fallback for turn %s (lang=%s)...", turn_id, target_lang)
-                pcm_data = await tts_service.synthesize(response_text, language_code=target_lang)
-                if not pcm_data:
-                    return
-
+            async with audio_coordinator.acquire_playback(playback_type, turn_id, generation_id):
+                logger.info("SAARTHI TTS INPUT%s: %s", " (PROGRESS)" if is_progress else "", response_text)
+                logger.info("Generating TTS response...")
                 if not is_progress:
-                    call_telemetry.on_tts_audio_ready(turn_id, len(pcm_data))
+                    call_telemetry.on_tts_start(turn_id)
 
-                if turn_id != current_turn_id or playback_cancel_event.is_set() or not session_active:
-                    logger.info("Discarding stale Saarthi response for turn %s", turn_id)
-                    return
+                playback_active = True
+                interrupted = False
+                first_chunk_sent = False
+                total_chunks = 0
+                chunk_size = 1600  # 100 ms of 8000 Hz, 16-bit mono PCM (multiple of 320)
+                buffer = bytearray()
+                total_pcm_bytes = 0
+                stream_failed = False
+                target_lang = detect_response_language(response_text)
 
-                logger.info("TTS playback started (REST fallback)")
-                rest_total_chunks = (len(pcm_data) + chunk_size - 1) // chunk_size
-                for i in range(0, len(pcm_data), chunk_size):
-                    if not session_active:
-                        interrupted = True
-                        break
-                    if playback_cancel_event.is_set() or turn_id != current_turn_id:
-                        interrupted = True
-                        break
-
-                    chunk = pcm_data[i : i + chunk_size]
-                    exotel_chunk_counter += 1
-                    total_chunks += 1
-                    timestamp_ms = int(i / 16)
-                    payload_b64 = base64.b64encode(chunk).decode("ascii")
-                    media_msg = {
-                        "event": "media",
-                        "stream_sid": sid,
-                        "media": {
-                            "chunk": str(exotel_chunk_counter),
-                            "timestamp": str(timestamp_ms),
-                            "payload": payload_b64,
-                        },
-                    }
-                    async with send_lock:
-                        if session_active and not playback_cancel_event.is_set() and turn_id == current_turn_id:
-                            await websocket.send_text(json.dumps(media_msg))
-                            if not first_chunk_sent:
-                                first_chunk_sent = True
-                                if is_progress:
-                                    progress_first_chunk_sent = True
-                                    logger.info("PROGRESS TTS FIRST AUDIO (turn %s)", turn_id)
-                                else:
-                                    call_telemetry.on_first_chunk_sent(turn_id)
-                        else:
+                # Primary path: Sarvam Streaming TTS
+                try:
+                    logger.info("Starting Sarvam Streaming TTS (turn %s, lang=%s)...", turn_id, target_lang)
+                    async for pcm_chunk in streaming_tts_service.stream_pcm_chunks(
+                        response_text,
+                        cancel_event=audio_coordinator.cancel_event,
+                        language_code=target_lang,
+                    ):
+                        if not session_active or audio_coordinator.cancel_event.is_set() or turn_id != current_turn_id:
                             interrupted = True
                             break
 
-                    await asyncio.sleep(len(chunk) / 16000.0)
+                        if not audio_coordinator.is_generation_active(turn_id, generation_id):
+                            if audio_coordinator.is_stale(turn_id, generation_id):
+                                logger.info("AUDIO STALE DROP: %s turn=%s", playback_type, turn_id)
+                            interrupted = True
+                            break
 
-            if interrupted:
-                logger.info("TTS playback interrupted (turn %s)", turn_id)
-                if is_progress:
-                    logger.info("PROGRESS CANCELLED (turn %s)", turn_id)
-                else:
-                    call_telemetry.on_turn_interrupted(turn_id, "barge-in")
-            elif first_chunk_sent:
-                logger.info("TTS playback completed | chunks=%d (turn %s)", total_chunks, turn_id)
-                if is_progress:
-                    logger.info("PROGRESS COMPLETE (turn %s)", turn_id)
-                else:
-                    call_telemetry.on_last_chunk_sent(turn_id, total_chunks)
+                        if not first_chunk_sent and len(pcm_chunk) > 0 and not is_progress:
+                            call_telemetry.on_tts_audio_ready(turn_id, len(pcm_chunk))
+
+                        buffer.extend(pcm_chunk)
+                        total_pcm_bytes += len(pcm_chunk)
+
+                        # Progressive forward to Exotel
+                        while len(buffer) >= chunk_size:
+                            if not session_active or audio_coordinator.cancel_event.is_set() or turn_id != current_turn_id:
+                                interrupted = True
+                                break
+
+                            if not audio_coordinator.is_generation_active(turn_id, generation_id):
+                                if audio_coordinator.is_stale(turn_id, generation_id):
+                                    logger.info("AUDIO STALE DROP: %s turn=%s", playback_type, turn_id)
+                                interrupted = True
+                                break
+
+                            chunk = bytes(buffer[:chunk_size])
+                            del buffer[:chunk_size]
+
+                            exotel_chunk_counter += 1
+                            total_chunks += 1
+                            timestamp_ms = int(total_chunks * 100)
+
+                            payload_b64 = base64.b64encode(chunk).decode("ascii")
+                            media_msg = {
+                                "event": "media",
+                                "stream_sid": sid,
+                                "media": {
+                                    "chunk": str(exotel_chunk_counter),
+                                    "timestamp": str(timestamp_ms),
+                                    "payload": payload_b64,
+                                },
+                            }
+
+                            async with send_lock:
+                                if session_active and audio_coordinator.is_generation_active(turn_id, generation_id) and turn_id == current_turn_id:
+                                    await websocket.send_text(json.dumps(media_msg))
+                                    if not first_chunk_sent:
+                                        first_chunk_sent = True
+                                        if is_progress:
+                                            progress_first_chunk_sent = True
+                                            logger.info("PROGRESS TTS FIRST AUDIO (turn %s)", turn_id)
+                                        else:
+                                            logger.info("TTS playback started (streaming)")
+                                            call_telemetry.on_first_chunk_sent(turn_id)
+                                else:
+                                    if audio_coordinator.is_stale(turn_id, generation_id):
+                                        logger.info("AUDIO STALE DROP: %s turn=%s", playback_type, turn_id)
+                                    interrupted = True
+                                    break
+
+                            # Real-time pacing (~100 ms per 1600 bytes)
+                            await asyncio.sleep(len(chunk) / 16000.0)
+
+                        if interrupted:
+                            break
+
+                    # Stream completed naturally; flush remaining buffered audio
+                    if not interrupted and session_active and audio_coordinator.is_generation_active(turn_id, generation_id) and turn_id == current_turn_id:
+                        call_telemetry.on_tts_stream_complete(turn_id, total_pcm_bytes)
+                        while len(buffer) > 0:
+                            if not session_active or audio_coordinator.cancel_event.is_set() or turn_id != current_turn_id:
+                                interrupted = True
+                                break
+
+                            if not audio_coordinator.is_generation_active(turn_id, generation_id):
+                                if audio_coordinator.is_stale(turn_id, generation_id):
+                                    logger.info("AUDIO STALE DROP: %s turn=%s", playback_type, turn_id)
+                                interrupted = True
+                                break
+
+                            chunk = bytes(buffer[:chunk_size])
+                            del buffer[:chunk_size]
+
+                            exotel_chunk_counter += 1
+                            total_chunks += 1
+                            timestamp_ms = int(total_chunks * 100)
+
+                            payload_b64 = base64.b64encode(chunk).decode("ascii")
+                            media_msg = {
+                                "event": "media",
+                                "stream_sid": sid,
+                                "media": {
+                                    "chunk": str(exotel_chunk_counter),
+                                    "timestamp": str(timestamp_ms),
+                                    "payload": payload_b64,
+                                },
+                            }
+
+                            async with send_lock:
+                                if session_active and audio_coordinator.is_generation_active(turn_id, generation_id) and turn_id == current_turn_id:
+                                    await websocket.send_text(json.dumps(media_msg))
+                                    if not first_chunk_sent:
+                                        first_chunk_sent = True
+                                        if is_progress:
+                                            progress_first_chunk_sent = True
+                                            logger.info("PROGRESS TTS FIRST AUDIO (turn %s)", turn_id)
+                                        else:
+                                            logger.info("TTS playback started (streaming)")
+                                            call_telemetry.on_first_chunk_sent(turn_id)
+                                else:
+                                    if audio_coordinator.is_stale(turn_id, generation_id):
+                                        logger.info("AUDIO STALE DROP: %s turn=%s", playback_type, turn_id)
+                                    interrupted = True
+                                    break
+
+                            await asyncio.sleep(len(chunk) / 16000.0)
+
+                except Exception as stream_err:
+                    if not first_chunk_sent:
+                        logger.warning(
+                            "Streaming TTS failed before sending audio, falling back to REST TTS: %s",
+                            stream_err,
+                        )
+                        stream_failed = True
+                    else:
+                        logger.error("Streaming TTS error during playback: %s", stream_err)
+                        interrupted = True
+
+                # Fallback path: If streaming TTS failed before any chunk was sent to Exotel
+                if (
+                    stream_failed
+                    and not interrupted
+                    and session_active
+                    and audio_coordinator.is_generation_active(turn_id, generation_id)
+                    and turn_id == current_turn_id
+                ):
+                    logger.info("Executing REST TTS fallback for turn %s (lang=%s)...", turn_id, target_lang)
+                    pcm_data = await tts_service.synthesize(response_text, language_code=target_lang)
+                    if not pcm_data:
+                        return
+
+                    if not is_progress:
+                        call_telemetry.on_tts_audio_ready(turn_id, len(pcm_data))
+
+                    if turn_id != current_turn_id or not audio_coordinator.is_generation_active(turn_id, generation_id) or not session_active:
+                        logger.info("Discarding stale Saarthi response for turn %s", turn_id)
+                        return
+
+                    logger.info("TTS playback started (REST fallback)")
+                    rest_total_chunks = (len(pcm_data) + chunk_size - 1) // chunk_size
+                    for i in range(0, len(pcm_data), chunk_size):
+                        if not session_active or turn_id != current_turn_id:
+                            interrupted = True
+                            break
+                        if not audio_coordinator.is_generation_active(turn_id, generation_id):
+                            if audio_coordinator.is_stale(turn_id, generation_id):
+                                logger.info("AUDIO STALE DROP: %s turn=%s", playback_type, turn_id)
+                            interrupted = True
+                            break
+
+                        chunk = pcm_data[i : i + chunk_size]
+                        exotel_chunk_counter += 1
+                        total_chunks += 1
+                        timestamp_ms = int(i / 16)
+                        payload_b64 = base64.b64encode(chunk).decode("ascii")
+                        media_msg = {
+                            "event": "media",
+                            "stream_sid": sid,
+                            "media": {
+                                "chunk": str(exotel_chunk_counter),
+                                "timestamp": str(timestamp_ms),
+                                "payload": payload_b64,
+                            },
+                        }
+                        async with send_lock:
+                            if session_active and audio_coordinator.is_generation_active(turn_id, generation_id) and turn_id == current_turn_id:
+                                await websocket.send_text(json.dumps(media_msg))
+                                if not first_chunk_sent:
+                                    first_chunk_sent = True
+                                    if is_progress:
+                                        progress_first_chunk_sent = True
+                                        logger.info("PROGRESS TTS FIRST AUDIO (turn %s)", turn_id)
+                                    else:
+                                        call_telemetry.on_first_chunk_sent(turn_id)
+                            else:
+                                if audio_coordinator.is_stale(turn_id, generation_id):
+                                    logger.info("AUDIO STALE DROP: %s turn=%s", playback_type, turn_id)
+                                interrupted = True
+                                break
+
+                        await asyncio.sleep(len(chunk) / 16000.0)
+
+                if interrupted:
+                    logger.info("TTS playback interrupted (turn %s)", turn_id)
+                    if is_progress:
+                        logger.info("PROGRESS CANCELLED (turn %s)", turn_id)
+                    else:
+                        call_telemetry.on_turn_interrupted(turn_id, "barge-in")
+                elif first_chunk_sent:
+                    logger.info("TTS playback completed | chunks=%d (turn %s)", total_chunks, turn_id)
+                    if is_progress:
+                        logger.info("PROGRESS COMPLETE (turn %s)", turn_id)
+                    else:
+                        call_telemetry.on_last_chunk_sent(turn_id, total_chunks)
 
         except asyncio.CancelledError:
             logger.info("TTS playback interrupted")
@@ -420,7 +490,14 @@ async def voice_stream(websocket: WebSocket):
         try:
             logger.info("Saarthi initial greeting starting...")
             logger.info("SAARTHI GREETING: %s", INITIAL_GREETING_TEXT)
-            await play_tts_response(INITIAL_GREETING_TEXT, sid, turn_id)
+            greeting_gen = audio_coordinator.new_generation("greeting", turn_id)
+            await play_tts_response(
+                INITIAL_GREETING_TEXT,
+                sid,
+                turn_id,
+                playback_type="greeting",
+                generation_id=greeting_gen,
+            )
             if session_active and not playback_cancel_event.is_set() and turn_id == current_turn_id:
                 logger.info("Initial greeting playback completed")
         except asyncio.CancelledError:
@@ -433,6 +510,7 @@ async def voice_stream(websocket: WebSocket):
         try:
             logger.info("Saarthi agent processing | turn=%s...", turn_id)
             call_telemetry.on_agent_start(turn_id)
+            is_error_response = False
             try:
                 agent_result = await asyncio.wait_for(
                     call_agent.invoke_async(customer_text),
@@ -449,9 +527,11 @@ async def voice_stream(websocket: WebSocket):
             except asyncio.TimeoutError:
                 logger.warning("Agent invocation timed out for turn %s", turn_id)
                 raw_response = "Sorry, I took a little too long to respond. Could you please say that again?"
+                is_error_response = True
             except Exception:
                 logger.exception("Agent invocation failed for turn %s", turn_id)
                 raw_response = "Sorry, I had trouble processing that. Could you please say that again?"
+                is_error_response = True
 
             if turn_id != current_turn_id or playback_cancel_event.is_set():
                 logger.info("Discarding stale Saarthi response for turn %s", turn_id)
@@ -469,13 +549,17 @@ async def voice_stream(websocket: WebSocket):
                 if progress_first_chunk_sent:
                     try:
                         await progress_tts_task
-                    except asyncio.CancelledError:
-                        pass
-                    except Exception:
+                    except (asyncio.CancelledError, Exception):
                         pass
                 else:
                     logger.info("Cancelling un-started progress TTS in favor of immediate final response (turn %s)", turn_id)
+                    if progress_generation_id:
+                        audio_coordinator.cancel_generation(turn_id, progress_generation_id, "progress")
                     progress_tts_task.cancel()
+                    try:
+                        await progress_tts_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
 
             if not session_active or turn_id != current_turn_id or playback_cancel_event.is_set():
                 logger.info("Discarding stale Saarthi response for turn %s", turn_id)
@@ -495,7 +579,18 @@ async def voice_stream(websocket: WebSocket):
                 tts_task.cancel()
 
             playback_cancel_event.clear()
-            tts_task = asyncio.create_task(play_tts_response(tts_text, sid, turn_id))
+            playback_type = "error" if is_error_response else "final"
+            final_gen_id = audio_coordinator.new_generation(playback_type, turn_id)
+            tts_task = asyncio.create_task(
+                play_tts_response(
+                    tts_text,
+                    sid,
+                    turn_id,
+                    playback_type=playback_type,
+                    generation_id=final_gen_id,
+                )
+            )
+            audio_coordinator.register_task(tts_task)
             await tts_task
 
         except asyncio.CancelledError:
@@ -526,6 +621,7 @@ async def voice_stream(websocket: WebSocket):
                     cancel_active_playback("vad.speech_start")
                     # Increment conversational turn ID so any in-flight response becomes stale
                     current_turn_id += 1
+                    audio_coordinator.start_new_turn(current_turn_id)
                     progress_manager.start_new_turn(current_turn_id)
                 elif event == "transcript.partial":
                     text = data.get("text", "").strip()
@@ -547,6 +643,7 @@ async def voice_stream(websocket: WebSocket):
                             # If audio was still playing, cancel immediately
                             cancel_active_playback("transcript.final")
                             current_turn_id += 1
+                            audio_coordinator.start_new_turn(current_turn_id)
                             progress_manager.start_new_turn(current_turn_id)
 
                             # Clear cancel event for the new turn
@@ -643,8 +740,10 @@ async def voice_stream(websocket: WebSocket):
                     greeting_started = True
                     current_turn_id += 1
                     greeting_turn = current_turn_id
+                    audio_coordinator.start_new_turn(greeting_turn)
                     playback_cancel_event.clear()
                     greeting_task = asyncio.create_task(play_initial_greeting(stream_sid, greeting_turn))
+                    audio_coordinator.register_task(greeting_task)
 
             elif event == "media":
                 media = data.get("media", {})
