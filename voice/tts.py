@@ -38,7 +38,7 @@ class SarvamTTSService:
         self.speech_sample_rate = speech_sample_rate
         self.pace = pace
 
-    async def synthesize(self, text: str) -> bytes:
+    async def synthesize(self, text: str, language_code: Optional[str] = None) -> bytes:
         """
         Synthesizes text into raw 8000 Hz, 16-bit mono little-endian PCM bytes.
         Validates WAV container properties and strips the RIFF header.
@@ -48,9 +48,10 @@ class SarvamTTSService:
         if not text or not text.strip():
             return b""
 
+        effective_lang = language_code or self.target_language_code
         payload = {
             "text": text,
-            "target_language_code": self.target_language_code,
+            "target_language_code": effective_lang,
             "speaker": self.speaker,
             "model": self.model,
             "speech_sample_rate": self.speech_sample_rate,

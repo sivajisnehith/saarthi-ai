@@ -48,6 +48,7 @@ class TurnMetrics:
         self.tts_request_start_ts: Optional[float] = None
         self.tts_network_received_ts: Optional[float] = None
         self.tts_pcm_ready_ts: Optional[float] = None
+        self.tts_stream_complete_ts: Optional[float] = None
         self.tts_bytes: int = 0
         # H. Playback
         self.first_chunk_ts: Optional[float] = None
@@ -97,7 +98,12 @@ class TurnMetrics:
 
     @property
     def tts_total_ms(self) -> Optional[float]:
-        return self.tts_first_audio_ms
+        if self.tts_request_start_ts:
+            if self.tts_stream_complete_ts:
+                return round((self.tts_stream_complete_ts - self.tts_request_start_ts) * 1000, 2)
+            if self.tts_pcm_ready_ts:
+                return round((self.tts_pcm_ready_ts - self.tts_request_start_ts) * 1000, 2)
+        return None
 
     @property
     def playback_ms(self) -> Optional[float]:
@@ -141,13 +147,11 @@ class TurnMetrics:
 
 
 class CallTelemetry:
-    def __init__(self, stream_sid: Optional[str] = None, call_sid: Optional[str] = None):
-        self.stream_sid = stream_sid
+    def __init__(self, call_sid: str = ""):
         self.call_sid = call_sid
-        self.call_start_ts = time.perf_counter()
+        self.call_start_ts: float = time.perf_counter()
         self.call_end_ts: Optional[float] = None
         self.turns: Dict[int, TurnMetrics] = {}
-        self.active_turn_id: int = 0
         self._current_speech_start_ts: Optional[float] = None
         self._current_speech_end_ts: Optional[float] = None
 
@@ -222,6 +226,12 @@ class CallTelemetry:
         turn = self.get_or_create_turn(turn_id)
         turn.tts_pcm_ready_ts = now
         turn.tts_bytes = pcm_bytes_len
+
+    def on_tts_stream_complete(self, turn_id: int, total_bytes: int):
+        now = time.perf_counter()
+        turn = self.get_or_create_turn(turn_id)
+        turn.tts_stream_complete_ts = now
+        turn.tts_bytes = total_bytes
 
     def on_first_chunk_sent(self, turn_id: int):
         now = time.perf_counter()
@@ -300,16 +310,34 @@ class CallTelemetry:
         return "\n".join(lines)
 
 
-def attach_strands_telemetry(agent: Any, telemetry: CallTelemetry, turn_id_provider: Any):
+def attach_strands_telemetry(
+    agent: Any,
+    telemetry: CallTelemetry,
+    turn_id_provider: Any,
+    before_tool_callback: Optional[Any] = None,
+):
     """
-    Attaches Strands hook callbacks to monitor Bedrock model and tool invocations.
+    Attaches Strands hook callbacks to monitor Bedrock model and tool invocations,
+    with support for pre-tool progress message execution.
     """
+    import inspect
     from strands.hooks import (
         BeforeModelCallEvent,
         AfterModelCallEvent,
         BeforeToolCallEvent,
         AfterToolCallEvent,
     )
+
+    def _extract_tool_name(event: Any) -> str:
+        tool_use = getattr(event, "tool_use", None)
+        if isinstance(tool_use, dict):
+            return tool_use.get("name", "unknown_tool")
+        elif hasattr(tool_use, "name"):
+            return str(tool_use.name)
+        selected_tool = getattr(event, "selected_tool", None)
+        if hasattr(selected_tool, "name"):
+            return str(selected_tool.name)
+        return "unknown_tool"
 
     def on_before_model(event: BeforeModelCallEvent):
         current_turn = turn_id_provider()
@@ -319,24 +347,27 @@ def attach_strands_telemetry(agent: Any, telemetry: CallTelemetry, turn_id_provi
         current_turn = turn_id_provider()
         telemetry.on_model_end(current_turn)
 
-    def on_before_tool(event: BeforeToolCallEvent):
+    async def on_before_tool(event: BeforeToolCallEvent):
         current_turn = turn_id_provider()
-        tool_name = (
-            event.tool_use.name
-            if getattr(event, "tool_use", None)
-            else getattr(event.selected_tool, "name", "unknown_tool")
-        )
+        tool_name = _extract_tool_name(event)
         telemetry.on_tool_start(current_turn, tool_name)
+        logger.info("TOOL START: %s (turn %s)", tool_name, current_turn)
+        if before_tool_callback:
+            try:
+                if inspect.iscoroutinefunction(before_tool_callback):
+                    await before_tool_callback(tool_name, current_turn)
+                else:
+                    before_tool_callback(tool_name, current_turn)
+            except Exception as ex:
+                logger.error("Error executing before_tool_callback for tool '%s': %s", tool_name, ex)
 
     def on_after_tool(event: AfterToolCallEvent):
         current_turn = turn_id_provider()
-        tool_name = (
-            event.tool_use.name
-            if getattr(event, "tool_use", None)
-            else getattr(event.selected_tool, "name", "unknown_tool")
-        )
+        tool_name = _extract_tool_name(event)
         duration = getattr(event, "duration", None)
         telemetry.on_tool_end(current_turn, tool_name, duration)
+        dur_ms = (duration * 1000) if duration is not None else 0.0
+        logger.info("TOOL COMPLETE: %s duration_ms=%.1f (turn %s)", tool_name, dur_ms, current_turn)
 
     agent.add_hook(BeforeModelCallEvent, on_before_model)
     agent.add_hook(AfterModelCallEvent, on_after_model)

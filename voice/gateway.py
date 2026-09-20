@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import re
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import urlencode
 
 from dotenv import load_dotenv
@@ -13,6 +13,7 @@ import websockets
 
 from agent.agent import create_saarthi_agent
 from voice.tts import SarvamTTSService
+from voice.streaming_tts import SarvamStreamingTTSService
 
 load_dotenv()
 
@@ -50,246 +51,36 @@ tts_service = SarvamTTSService(
     pace=1.0,
 )
 
-
-INTERNAL_TAGS = [
-    "reasoning",
-    "thought",
-    "think",
-    "analysis",
-    "internal",
-    "tool",
-    "tool_call",
-    "tool_response",
-    "tool_selection",
-    "scratchpad",
-    "planning",
-    "plan",
-    "reflection",
-    "decision",
-    "system",
-    "instruction",
-]
-
-INTERNAL_PHRASES = [
-    r"waiting for (?:your )?confirmation",
-    r"waiting for user confirmation",
-    r"waiting for the user to confirm",
-    r"internal decision making:?",
-    r"tool-selection reasoning:?",
-    r"chain-of-thought:?",
-    r"internal planning:?",
-]
+# Initialize streaming TTS service (primary playback path)
+streaming_tts_service = SarvamStreamingTTSService(
+    key_manager=sarvam_key_manager,
+    model="bulbul:v3",
+    speaker="kavya",
+    target_language_code="en-IN",
+    speech_sample_rate=8000,
+    pace=1.0,
+)
 
 
-def sanitize_agent_text(text: str) -> str:
-    """
-    Defensively strips reasoning tags, chain-of-thought, internal planning,
-    and developer/tool artifacts from text.
-    """
-    if not text:
-        return ""
 
-    # 1. Strip paired internal tags (e.g. <reasoning>...</reasoning>)
-    for tag in INTERNAL_TAGS:
-        pattern = rf"<{tag}\b[^>]*>.*?</{tag}>"
-        text = re.sub(pattern, "", text, flags=re.DOTALL | re.IGNORECASE)
+from voice.sanitizer import (
+    INTERNAL_TAGS,
+    INTERNAL_PHRASES,
+    is_internal_sentence,
+    sanitize_agent_text,
+    sanitize_multilingual_contamination,
+    detect_response_language,
+    enforce_concise_voice_response,
+    clean_text_for_tts,
+    extract_agent_response,
+)
+from voice.progress import (
+    TOOL_PROGRESS_STAGES,
+    ProgressManager,
+    strip_redundant_progress_prefix,
+    set_active_progress_callback,
+)
 
-    # 2. Strip unclosed opening tags at beginning of text
-    for tag in INTERNAL_TAGS:
-        pattern = rf"^\s*<{tag}\b[^>]*>.*?(?=\n\n|\Z)"
-        text = re.sub(pattern, "", text, flags=re.DOTALL | re.IGNORECASE)
-
-    # 3. Strip trailing unclosed opening tags
-    for tag in INTERNAL_TAGS:
-        pattern = rf"<{tag}\b[^>]*>.*$"
-        text = re.sub(pattern, "", text, flags=re.DOTALL | re.IGNORECASE)
-
-    # 4. Strip stray closing tags (e.g. </reasoning>)
-    for tag in INTERNAL_TAGS:
-        text = re.sub(rf"</{tag}>", "", text, flags=re.IGNORECASE)
-
-    # 5. Strip internal status phrases
-    for phrase in INTERNAL_PHRASES:
-        text = re.sub(rf"(?i)\b{phrase}\b[.:]?", "", text)
-
-    # 6. Strip markdown code blocks of tool calls / json payloads
-    text = re.sub(
-        r"```(?:json|tool|tool_call)?\s*[\{\[].*?[\}\]]\s*```",
-        "",
-        text,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-
-    # 7. Normalize whitespace
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n\s*\n", "\n", text).strip()
-    return text
-
-
-def enforce_concise_voice_response(text: str, max_words: int = 50) -> str:
-    """
-    Defensive sentence-aware length safeguard for telephone voice responses.
-    Ensures spoken responses stay within a natural conversational duration (~5-15s),
-    preventing 100+ chunk TTS audio monologues while never truncating mid-sentence,
-    mid-word, mid-email, or mid-URL.
-    """
-    if not text:
-        return ""
-
-    # Normalize whitespace
-    text = re.sub(r"\s+", " ", text).strip()
-    words = text.split()
-
-    # If within acceptable conversational word budget, return unchanged
-    if len(words) <= max_words:
-        return text
-
-    # Split into complete sentences based on punctuation (.!?)
-    sentence_pattern = r"(?<=[.!?])\s+"
-    sentences = [s.strip() for s in re.split(sentence_pattern, text) if s.strip()]
-
-    # If already 1 or 2 sentences, don't chop further unless excessively long
-    if len(sentences) <= 2 and len(words) <= max_words + 15:
-        return text
-
-    # If we have multiple sentences:
-    # Always keep sentence 0 (the primary statement / confirmation)
-    selected = [sentences[0]]
-
-    # Check if the final sentence is a question (the prompt for customer action)
-    last_sentence = sentences[-1]
-    last_is_question = last_sentence.endswith("?")
-
-    if last_is_question and len(sentences) > 1:
-        # Check if sentence 1 can also fit between sentence 0 and the question
-        if len(sentences) > 2:
-            candidate = f"{sentences[0]} {sentences[1]} {last_sentence}"
-            if len(candidate.split()) <= max_words:
-                selected.append(sentences[1])
-        selected.append(last_sentence)
-    else:
-        # Last sentence is not a question, pack first 2-3 complete sentences up to max_words
-        for s in sentences[1:]:
-            candidate = " ".join(selected + [s])
-            if len(candidate.split()) <= max_words:
-                selected.append(s)
-            else:
-                break
-
-    result = " ".join(selected).strip()
-    return result if result else text
-
-
-def extract_agent_response(agent_result: Any) -> str:
-    """
-    Extracts purely user-facing text from a Strands AgentResult or similar agent output.
-    Explicitly filters out:
-    - reasoningContent blocks
-    - toolUse / toolResult blocks
-    - internal tags (<reasoning>, <thought>, <analysis>, <tool>, etc.)
-    - internal status phrases (e.g. 'Waiting for your confirmation')
-    """
-    if agent_result is None:
-        return ""
-
-    raw_text = ""
-
-    # 1. Inspect message dict from AgentResult
-    message = getattr(agent_result, "message", None)
-    if isinstance(message, dict):
-        content = message.get("content", [])
-        if isinstance(content, list):
-            text_blocks = []
-            for item in content:
-                if not isinstance(item, dict):
-                    continue
-                # Never include reasoningContent, toolUse, or toolResult in customer text
-                if "reasoningContent" in item or "toolUse" in item or "toolResult" in item:
-                    continue
-                if "text" in item and isinstance(item["text"], str):
-                    text_blocks.append(item["text"])
-                elif "citationsContent" in item and isinstance(item["citationsContent"], dict):
-                    c_content = item["citationsContent"].get("content", [])
-                    for sub in c_content:
-                        if isinstance(sub, dict) and "text" in sub:
-                            text_blocks.append(sub["text"])
-            if text_blocks:
-                raw_text = "\n".join(text_blocks)
-
-    # 2. Check structured_output if present and no text yet
-    if not raw_text:
-        structured = getattr(agent_result, "structured_output", None)
-        if structured:
-            if hasattr(structured, "model_dump_json"):
-                raw_text = structured.model_dump_json()
-            else:
-                raw_text = str(structured)
-
-    # 3. Fallback to str(agent_result) if still empty
-    if not raw_text:
-        raw_text = str(agent_result) if agent_result else ""
-
-    # 4. Primary fix: strip all internal reasoning, thought tags, and internal phrases
-    clean_text = sanitize_agent_text(raw_text)
-
-    # 5. Defensive voice conciseness safeguard
-    clean_text = enforce_concise_voice_response(clean_text)
-
-    return clean_text.strip()
-
-
-def clean_text_for_tts(text: str) -> str:
-    """
-    Text normalization for TTS playback:
-    1. Defensive safety filter: strips reasoning tags, internal thought markers,
-       tool calls, and status messages.
-    2. Strips markdown code blocks, links, headers, asterisks, bullet points.
-    3. Converts currency symbols to natural speech.
-    """
-    if not text:
-        return ""
-
-    # Defensive safety filter (last line of protection)
-    text = sanitize_agent_text(text)
-    if not text:
-        return ""
-
-    # Defensive voice conciseness safeguard
-    text = enforce_concise_voice_response(text)
-    if not text:
-        return ""
-
-    # Remove code blocks and inline code
-    text = re.sub(r"```[\s\S]*?```", "", text)
-    text = re.sub(r"`([^`]+)`", r"\1", text)
-
-    # Remove markdown links: [label](url) -> label
-    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
-
-    # Remove raw URLs
-    text = re.sub(r"https?://\S+", "", text)
-
-    # Replace currency symbols: ???899 -> 899 rupees, ???1,099 -> 1,099 rupees
-    text = re.sub(r"\u20b9\s*([0-9]+(?:,[0-9]+)*(?:\.[0-9]+)?)", r"\1 rupees", text)
-    text = text.replace("\u20b9", " rupees ")
-
-    # Format 24-hour departure/arrival times to natural 12-hour spoken format (e.g. 21:00 -> 9 PM)
-    text = format_spoken_times(text)
-
-    # Remove markdown emphasis (bold, italics)
-    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
-    text = re.sub(r"\*([^*]+)\*", r"\1", text)
-    text = re.sub(r"__([^_]+)__", r"\1", text)
-    text = re.sub(r"_([^_]+)_", r"\1", text)
-
-    # Remove headers and list bullets
-    text = re.sub(r"^#+\s*", "", text, flags=re.MULTILINE)
-    text = re.sub(r"^\s*[-*?]\s*", "", text, flags=re.MULTILINE)
-
-    # Collapse multiple whitespace / newlines
-    text = re.sub(r"\s+", " ", text).strip()
-
-    return text
 
 
 def get_sarvam_ws_url() -> str:
@@ -326,14 +117,15 @@ async def voice_stream(websocket: WebSocket):
     # Create an isolated Saarthi Agent for this specific phone call session
     call_telemetry = CallTelemetry()
     call_agent = create_saarthi_agent(voice=True)
-    attach_strands_telemetry(call_agent, call_telemetry, lambda: current_turn_id)
-    logger.info("Initialized per-call Saarthi agent | session_id=%s", call_agent.session_id)
+    progress_manager = ProgressManager()
 
     sarvam_ws = None
     sarvam_recv_task = None
     agent_task = None
     tts_task = None
     greeting_task = None
+    progress_tts_task = None
+    progress_first_chunk_sent = False
 
     stream_sid = None
     caller = None
@@ -351,17 +143,54 @@ async def voice_stream(websocket: WebSocket):
         nonlocal playback_active
         is_greeting = greeting_task is not None and not greeting_task.done()
         is_tts = tts_task is not None and not tts_task.done()
-        if playback_active or is_greeting or is_tts:
-            logger.info("Customer barge-in detected — cancelling TTS")
+        is_progress = progress_tts_task is not None and not progress_tts_task.done()
+        if playback_active or is_greeting or is_tts or is_progress:
+            logger.info("Customer barge-in detected – cancelling TTS (%s)", source)
             playback_cancel_event.set()
             playback_active = False
             if tts_task and not tts_task.done():
                 tts_task.cancel()
+            if progress_tts_task and not progress_tts_task.done():
+                progress_tts_task.cancel()
             if greeting_task and not greeting_task.done():
                 greeting_task.cancel()
 
-    async def play_tts_response(response_text: str, sid: str, turn_id: int):
-        nonlocal exotel_chunk_counter, playback_active
+    async def on_tool_progress(tool_name: str, turn_id: Optional[int] = None):
+        nonlocal stream_sid, session_active, playback_cancel_event, progress_tts_task, progress_first_chunk_sent
+        if turn_id is None:
+            turn_id = current_turn_id
+        if not session_active or playback_cancel_event.is_set() or not stream_sid:
+            return
+
+        progress_info = progress_manager.get_progress_for_tool(tool_name)
+        if not progress_info:
+            return
+
+        stage_id, progress_msg = progress_info
+        progress_manager.mark_stage_announced(stage_id)
+        logger.info(
+            "PROGRESS START: %s | stage=%s | text='%s' (turn %s)",
+            tool_name,
+            stage_id,
+            progress_msg,
+            turn_id,
+        )
+        progress_first_chunk_sent = False
+        progress_tts_task = asyncio.create_task(
+            play_tts_response(progress_msg, stream_sid, turn_id, is_progress=True)
+        )
+
+    attach_strands_telemetry(
+        call_agent,
+        call_telemetry,
+        lambda: current_turn_id,
+        before_tool_callback=on_tool_progress,
+    )
+    set_active_progress_callback(on_tool_progress)
+    logger.info("Initialized per-call Saarthi agent | session_id=%s", call_agent.session_id)
+
+    async def play_tts_response(response_text: str, sid: str, turn_id: int, is_progress: bool = False):
+        nonlocal exotel_chunk_counter, playback_active, progress_first_chunk_sent
         if not session_active:
             return
 
@@ -370,76 +199,217 @@ async def voice_stream(websocket: WebSocket):
             return
 
         try:
-            logger.info("SAARTHI TTS INPUT: %s", response_text)
+            logger.info("SAARTHI TTS INPUT%s: %s", " (PROGRESS)" if is_progress else "", response_text)
             logger.info("Generating TTS response...")
-            call_telemetry.on_tts_start(turn_id)
-            pcm_data = await tts_service.synthesize(response_text)
-            if not pcm_data:
-                return
-
-            call_telemetry.on_tts_audio_ready(turn_id, len(pcm_data))
-
-            if turn_id != current_turn_id or playback_cancel_event.is_set() or not session_active:
-                logger.info("Discarding stale Saarthi response for turn %s", turn_id)
-                return
+            if not is_progress:
+                call_telemetry.on_tts_start(turn_id)
 
             playback_active = True
             interrupted = False
             first_chunk_sent = False
-            logger.info("TTS playback started")
-            logger.info("TTS generated successfully | bytes=%d", len(pcm_data))
-
+            total_chunks = 0
             chunk_size = 1600  # 100 ms of 8000 Hz, 16-bit mono PCM (multiple of 320)
-            total_chunks = (len(pcm_data) + chunk_size - 1) // chunk_size
-            logger.info("Sending TTS to Exotel | chunks=%d", total_chunks)
+            buffer = bytearray()
+            total_pcm_bytes = 0
+            stream_failed = False
+            target_lang = detect_response_language(response_text)
 
-            for i in range(0, len(pcm_data), chunk_size):
-                if not session_active:
-                    logger.info("Session ended, stopping TTS playback")
-                    interrupted = True
-                    break
-
-                if playback_cancel_event.is_set() or turn_id != current_turn_id:
-                    interrupted = True
-                    break
-
-                chunk = pcm_data[i : i + chunk_size]
-                exotel_chunk_counter += 1
-                timestamp_ms = int(i / 16)  # 16 bytes per millisecond
-
-                payload_b64 = base64.b64encode(chunk).decode("ascii")
-                media_msg = {
-                    "event": "media",
-                    "stream_sid": sid,
-                    "media": {
-                        "chunk": str(exotel_chunk_counter),
-                        "timestamp": str(timestamp_ms),
-                        "payload": payload_b64,
-                    },
-                }
-
-                async with send_lock:
-                    if session_active and not playback_cancel_event.is_set() and turn_id == current_turn_id:
-                        await websocket.send_text(json.dumps(media_msg))
-                        if not first_chunk_sent:
-                            first_chunk_sent = True
-                            call_telemetry.on_first_chunk_sent(turn_id)
-                    else:
+            # Primary path: Sarvam Streaming TTS
+            try:
+                logger.info("Starting Sarvam Streaming TTS (turn %s, lang=%s)...", turn_id, target_lang)
+                async for pcm_chunk in streaming_tts_service.stream_pcm_chunks(
+                    response_text,
+                    cancel_event=playback_cancel_event,
+                    language_code=target_lang,
+                ):
+                    if not session_active or playback_cancel_event.is_set() or turn_id != current_turn_id:
                         interrupted = True
                         break
 
-                # Real-time pacing (~100 ms per 1600 bytes)
-                await asyncio.sleep(len(chunk) / 16000.0)
+                    if not first_chunk_sent and len(pcm_chunk) > 0 and not is_progress:
+                        call_telemetry.on_tts_audio_ready(turn_id, len(pcm_chunk))
+
+                    buffer.extend(pcm_chunk)
+                    total_pcm_bytes += len(pcm_chunk)
+
+                    # Progressive forward to Exotel
+                    while len(buffer) >= chunk_size:
+                        if not session_active or playback_cancel_event.is_set() or turn_id != current_turn_id:
+                            interrupted = True
+                            break
+
+                        chunk = bytes(buffer[:chunk_size])
+                        del buffer[:chunk_size]
+
+                        exotel_chunk_counter += 1
+                        total_chunks += 1
+                        timestamp_ms = int(total_chunks * 100)
+
+                        payload_b64 = base64.b64encode(chunk).decode("ascii")
+                        media_msg = {
+                            "event": "media",
+                            "stream_sid": sid,
+                            "media": {
+                                "chunk": str(exotel_chunk_counter),
+                                "timestamp": str(timestamp_ms),
+                                "payload": payload_b64,
+                            },
+                        }
+
+                        async with send_lock:
+                            if session_active and not playback_cancel_event.is_set() and turn_id == current_turn_id:
+                                await websocket.send_text(json.dumps(media_msg))
+                                if not first_chunk_sent:
+                                    first_chunk_sent = True
+                                    if is_progress:
+                                        progress_first_chunk_sent = True
+                                        logger.info("PROGRESS TTS FIRST AUDIO (turn %s)", turn_id)
+                                    else:
+                                        logger.info("TTS playback started (streaming)")
+                                        call_telemetry.on_first_chunk_sent(turn_id)
+                            else:
+                                interrupted = True
+                                break
+
+                        # Real-time pacing (~100 ms per 1600 bytes)
+                        await asyncio.sleep(len(chunk) / 16000.0)
+
+                    if interrupted:
+                        break
+
+                # Stream completed naturally; flush remaining buffered audio
+                if not interrupted and session_active and not playback_cancel_event.is_set() and turn_id == current_turn_id:
+                    call_telemetry.on_tts_stream_complete(turn_id, total_pcm_bytes)
+                    while len(buffer) > 0:
+                        if not session_active or playback_cancel_event.is_set() or turn_id != current_turn_id:
+                            interrupted = True
+                            break
+
+                        chunk = bytes(buffer[:chunk_size])
+                        del buffer[:chunk_size]
+
+                        exotel_chunk_counter += 1
+                        total_chunks += 1
+                        timestamp_ms = int(total_chunks * 100)
+
+                        payload_b64 = base64.b64encode(chunk).decode("ascii")
+                        media_msg = {
+                            "event": "media",
+                            "stream_sid": sid,
+                            "media": {
+                                "chunk": str(exotel_chunk_counter),
+                                "timestamp": str(timestamp_ms),
+                                "payload": payload_b64,
+                            },
+                        }
+
+                        async with send_lock:
+                            if session_active and not playback_cancel_event.is_set() and turn_id == current_turn_id:
+                                await websocket.send_text(json.dumps(media_msg))
+                                if not first_chunk_sent:
+                                    first_chunk_sent = True
+                                    if is_progress:
+                                        progress_first_chunk_sent = True
+                                        logger.info("PROGRESS TTS FIRST AUDIO (turn %s)", turn_id)
+                                    else:
+                                        logger.info("TTS playback started (streaming)")
+                                        call_telemetry.on_first_chunk_sent(turn_id)
+                            else:
+                                interrupted = True
+                                break
+
+                        await asyncio.sleep(len(chunk) / 16000.0)
+
+            except Exception as stream_err:
+                if not first_chunk_sent:
+                    logger.warning(
+                        "Streaming TTS failed before sending audio, falling back to REST TTS: %s",
+                        stream_err,
+                    )
+                    stream_failed = True
+                else:
+                    logger.error("Streaming TTS error during playback: %s", stream_err)
+                    interrupted = True
+
+            # Fallback path: If streaming TTS failed before any chunk was sent to Exotel
+            if (
+                stream_failed
+                and not interrupted
+                and session_active
+                and not playback_cancel_event.is_set()
+                and turn_id == current_turn_id
+            ):
+                logger.info("Executing REST TTS fallback for turn %s (lang=%s)...", turn_id, target_lang)
+                pcm_data = await tts_service.synthesize(response_text, language_code=target_lang)
+                if not pcm_data:
+                    return
+
+                if not is_progress:
+                    call_telemetry.on_tts_audio_ready(turn_id, len(pcm_data))
+
+                if turn_id != current_turn_id or playback_cancel_event.is_set() or not session_active:
+                    logger.info("Discarding stale Saarthi response for turn %s", turn_id)
+                    return
+
+                logger.info("TTS playback started (REST fallback)")
+                rest_total_chunks = (len(pcm_data) + chunk_size - 1) // chunk_size
+                for i in range(0, len(pcm_data), chunk_size):
+                    if not session_active:
+                        interrupted = True
+                        break
+                    if playback_cancel_event.is_set() or turn_id != current_turn_id:
+                        interrupted = True
+                        break
+
+                    chunk = pcm_data[i : i + chunk_size]
+                    exotel_chunk_counter += 1
+                    total_chunks += 1
+                    timestamp_ms = int(i / 16)
+                    payload_b64 = base64.b64encode(chunk).decode("ascii")
+                    media_msg = {
+                        "event": "media",
+                        "stream_sid": sid,
+                        "media": {
+                            "chunk": str(exotel_chunk_counter),
+                            "timestamp": str(timestamp_ms),
+                            "payload": payload_b64,
+                        },
+                    }
+                    async with send_lock:
+                        if session_active and not playback_cancel_event.is_set() and turn_id == current_turn_id:
+                            await websocket.send_text(json.dumps(media_msg))
+                            if not first_chunk_sent:
+                                first_chunk_sent = True
+                                if is_progress:
+                                    progress_first_chunk_sent = True
+                                    logger.info("PROGRESS TTS FIRST AUDIO (turn %s)", turn_id)
+                                else:
+                                    call_telemetry.on_first_chunk_sent(turn_id)
+                        else:
+                            interrupted = True
+                            break
+
+                    await asyncio.sleep(len(chunk) / 16000.0)
 
             if interrupted:
-                logger.info("TTS playback interrupted")
-                call_telemetry.on_turn_interrupted(turn_id, "barge-in")
-            else:
-                logger.info("TTS playback completed")
-                call_telemetry.on_last_chunk_sent(turn_id, total_chunks)
+                logger.info("TTS playback interrupted (turn %s)", turn_id)
+                if is_progress:
+                    logger.info("PROGRESS CANCELLED (turn %s)", turn_id)
+                else:
+                    call_telemetry.on_turn_interrupted(turn_id, "barge-in")
+            elif first_chunk_sent:
+                logger.info("TTS playback completed | chunks=%d (turn %s)", total_chunks, turn_id)
+                if is_progress:
+                    logger.info("PROGRESS COMPLETE (turn %s)", turn_id)
+                else:
+                    call_telemetry.on_last_chunk_sent(turn_id, total_chunks)
 
         except asyncio.CancelledError:
             logger.info("TTS playback interrupted")
+            if is_progress:
+                logger.info("PROGRESS CANCELLED (turn %s)", turn_id)
+            else:
+                call_telemetry.on_turn_interrupted(turn_id, "barge-in")
         except Exception:
             logger.exception("Error during TTS generation or playback")
         finally:
@@ -492,13 +462,30 @@ async def voice_stream(websocket: WebSocket):
 
             logger.info("SAARTHI SAID: %s", raw_response)
 
+            # If a pre-tool progress message is still actively streaming to the caller,
+            # wait for it to conclude cleanly before starting the final answer.
+            # If it hasn't sent any audio yet, cancel it so we speak the final response immediately.
+            if progress_tts_task and not progress_tts_task.done():
+                if progress_first_chunk_sent:
+                    try:
+                        await progress_tts_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
+                else:
+                    logger.info("Cancelling un-started progress TTS in favor of immediate final response (turn %s)", turn_id)
+                    progress_tts_task.cancel()
+
             if not session_active or turn_id != current_turn_id or playback_cancel_event.is_set():
                 logger.info("Discarding stale Saarthi response for turn %s", turn_id)
                 return
 
-            tts_text = clean_text_for_tts(raw_response)
+            tts_text = clean_text_for_tts(raw_response, announced_progress_stages=progress_manager.announced_stages)
             if not tts_text:
                 return
+
+            logger.info("FINAL RESPONSE: %s (turn %s)", tts_text, turn_id)
 
             if turn_id != current_turn_id or playback_cancel_event.is_set():
                 logger.info("Discarding stale Saarthi response for turn %s", turn_id)
@@ -539,6 +526,7 @@ async def voice_stream(websocket: WebSocket):
                     cancel_active_playback("vad.speech_start")
                     # Increment conversational turn ID so any in-flight response becomes stale
                     current_turn_id += 1
+                    progress_manager.start_new_turn(current_turn_id)
                 elif event == "transcript.partial":
                     text = data.get("text", "").strip()
                     if text:
@@ -559,6 +547,7 @@ async def voice_stream(websocket: WebSocket):
                             # If audio was still playing, cancel immediately
                             cancel_active_playback("transcript.final")
                             current_turn_id += 1
+                            progress_manager.start_new_turn(current_turn_id)
 
                             # Clear cancel event for the new turn
                             playback_cancel_event.clear()
@@ -684,9 +673,19 @@ async def voice_stream(websocket: WebSocket):
         logger.exception("Voice stream error")
 
     finally:
+        set_active_progress_callback(None)
         session_active = False
         playback_cancel_event.set()
         call_telemetry.end_call()
+
+        if progress_tts_task and not progress_tts_task.done():
+            progress_tts_task.cancel()
+            try:
+                await progress_tts_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
 
         if tts_task and not tts_task.done():
             tts_task.cancel()
